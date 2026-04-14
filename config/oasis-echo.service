@@ -1,0 +1,24 @@
+[Unit]
+Description=OASIS ECHO - Enhanced Cellular Handling Operations
+After=network.target mosquitto.service sim7600-rndis.service
+Wants=mosquitto.service
+Documentation=https://github.com/The-OASIS-Project/echo
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/oasis-echo --service \
+  --mqtt-host ${MQTT_HOST} --mqtt-port ${MQTT_PORT} \
+  --serial-port ${SERIAL_PORT} --serial-baud ${SERIAL_BAUD}
+EnvironmentFile=/etc/oasis/echo.conf
+Restart=on-failure
+RestartSec=5s
+User=oasis
+Group=oasis
+ProtectSystem=full
+ProtectHome=true
+PrivateTmp=true
+NoNewPrivileges=true
+SupplementaryGroups=dialout
+
+[Install]
+WantedBy=multi-user.target
