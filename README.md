@@ -96,6 +96,20 @@ Send JSON to `echo/cmd`:
 sudo systemctl enable --now oasis-echo
 ```
 
+## Dependencies
+
+- **libmosquitto** — MQTT client (`sudo apt-get install libmosquitto-dev`)
+- **json-c** — JSON parsing (`sudo apt-get install libjson-c-dev`)
+- **pthread** — threading (system, no install needed)
+- **clang-format-14** — code formatting (`sudo apt-get install clang-format-14`)
+
+## Documentation
+
+- [ARCHITECTURE.md](ARCHITECTURE.md) — Threading model, module map, AT command design, security model
+- [CODING_STYLE_GUIDE.md](CODING_STYLE_GUIDE.md) — C coding standards for ECHO and OASIS
+- [CLAUDE.md](CLAUDE.md) — Development guidance for AI-assisted coding
+- [PHONE_SMS_DESIGN.md](https://github.com/The-OASIS-Project/dawn/blob/main/docs/PHONE_SMS_DESIGN.md) — Full system design (ECHO + DAWN integration)
+
 ## Security
 
 - Phone number validation: `[+*#0-9]{1,20}` — rejects injection characters
