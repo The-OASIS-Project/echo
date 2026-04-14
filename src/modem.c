@@ -62,7 +62,9 @@ int modem_init(at_context_t *at) {
    /* Core setup — failures are warnings, not fatal */
    init_cmd(at, "ATE0", "disable echo");
    init_cmd(at, "AT+CMEE=2", "verbose errors");
-   init_cmd(at, "AT+CSCS=\"GSM\"", "GSM charset");
+   /* Keep modem default UCS2 charset for full Unicode/emoji SMS support.
+    * AT+CSMP DCS=8 tells the network the body is UCS2-encoded. */
+   init_cmd(at, "AT+CSMP=17,167,0,8", "SMS params UCS2 DCS");
    init_cmd(at, "AT+CLIP=1", "caller ID");
    init_cmd(at, "AT+CMGF=1", "SMS text mode");
    init_cmd(at, "AT+CPMS=\"ME\",\"ME\",\"ME\"", "SMS storage to ME");

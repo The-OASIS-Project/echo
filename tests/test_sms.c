@@ -163,6 +163,82 @@ void test_sanitize_clip_garbage(void) {
    TEST_ASSERT_FALSE(sms_sanitize_clip("BLOCKED", out, sizeof(out)));
 }
 
+/* ── UCS2 encoding/decoding ───────────────────────────────────────────── */
+
+void test_ucs2_encode_ascii(void) {
+   char hex[128];
+   int len = sms_utf8_to_ucs2_hex("Hi", hex, sizeof(hex));
+   TEST_ASSERT_EQUAL_INT(8, len);
+   TEST_ASSERT_EQUAL_STRING("00480069", hex);
+}
+
+void test_ucs2_encode_phone_number(void) {
+   char hex[128];
+   int len = sms_utf8_to_ucs2_hex("+16786432695", hex, sizeof(hex));
+   TEST_ASSERT_GREATER_THAN(0, len);
+   /* + = 002B, 1 = 0031, etc. */
+   TEST_ASSERT_EQUAL_STRING("002B00310036003700380036003400330032003600390035", hex);
+}
+
+void test_ucs2_encode_emoji(void) {
+   /* 🎯 = U+1F3AF → surrogate pair D83C DFAF */
+   char hex[128];
+   int len = sms_utf8_to_ucs2_hex("\xF0\x9F\x8E\xAF", hex, sizeof(hex));
+   TEST_ASSERT_EQUAL_INT(8, len);
+   TEST_ASSERT_EQUAL_STRING("D83CDFAF", hex);
+}
+
+void test_ucs2_encode_mixed(void) {
+   /* "Hi 🎯" = H(0048) i(0069) space(0020) 🎯(D83C DFAF) */
+   char hex[128];
+   int len = sms_utf8_to_ucs2_hex("Hi \xF0\x9F\x8E\xAF", hex, sizeof(hex));
+   TEST_ASSERT_EQUAL_INT(20, len); /* 3 BMP chars (12) + 1 surrogate (8) = 20 */
+   TEST_ASSERT_EQUAL_STRING("004800690020D83CDFAF", hex);
+}
+
+void test_ucs2_decode_ascii(void) {
+   char utf8[128];
+   int len = sms_ucs2_hex_to_utf8("00480069", utf8, sizeof(utf8));
+   TEST_ASSERT_EQUAL_INT(2, len);
+   TEST_ASSERT_EQUAL_STRING("Hi", utf8);
+}
+
+void test_ucs2_decode_phone_number(void) {
+   char utf8[32];
+   int len = sms_ucs2_hex_to_utf8("002B00310036003700380036003400330032003600390035", utf8,
+                                  sizeof(utf8));
+   TEST_ASSERT_EQUAL_STRING("+16786432695", utf8);
+   TEST_ASSERT_GREATER_THAN(0, len);
+}
+
+void test_ucs2_decode_emoji(void) {
+   char utf8[32];
+   int len = sms_ucs2_hex_to_utf8("D83CDFAF", utf8, sizeof(utf8));
+   TEST_ASSERT_EQUAL_INT(4, len); /* 🎯 is 4 bytes in UTF-8 */
+   TEST_ASSERT_EQUAL_STRING("\xF0\x9F\x8E\xAF", utf8);
+}
+
+void test_ucs2_roundtrip(void) {
+   const char *original = "Hello \xF0\x9F\x98\x80 World!"; /* Hello 😀 World! */
+   char hex[512];
+   sms_utf8_to_ucs2_hex(original, hex, sizeof(hex));
+
+   char decoded[256];
+   sms_ucs2_hex_to_utf8(hex, decoded, sizeof(decoded));
+
+   TEST_ASSERT_EQUAL_STRING(original, decoded);
+}
+
+void test_ucs2_decode_null(void) {
+   char utf8[32];
+   TEST_ASSERT_EQUAL_INT(-1, sms_ucs2_hex_to_utf8(NULL, utf8, sizeof(utf8)));
+}
+
+void test_ucs2_encode_null(void) {
+   char hex[32];
+   TEST_ASSERT_EQUAL_INT(-1, sms_utf8_to_ucs2_hex(NULL, hex, sizeof(hex)));
+}
+
 /* ── Runner ──────────────────────────────────────────────────────────── */
 
 int main(void) {
@@ -197,6 +273,18 @@ int main(void) {
    RUN_TEST(test_sanitize_clip_strips_junk);
    RUN_TEST(test_sanitize_clip_empty);
    RUN_TEST(test_sanitize_clip_garbage);
+
+   /* UCS2 encoding/decoding */
+   RUN_TEST(test_ucs2_encode_ascii);
+   RUN_TEST(test_ucs2_encode_phone_number);
+   RUN_TEST(test_ucs2_encode_emoji);
+   RUN_TEST(test_ucs2_encode_mixed);
+   RUN_TEST(test_ucs2_decode_ascii);
+   RUN_TEST(test_ucs2_decode_phone_number);
+   RUN_TEST(test_ucs2_decode_emoji);
+   RUN_TEST(test_ucs2_roundtrip);
+   RUN_TEST(test_ucs2_decode_null);
+   RUN_TEST(test_ucs2_encode_null);
 
    return UNITY_END();
 }

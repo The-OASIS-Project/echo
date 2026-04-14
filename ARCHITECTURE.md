@@ -86,7 +86,7 @@ urc_handler.c (393 lines)
 └── read_line — byte-at-a-time with VTIME timeout
 
 modem.c (325 lines)
-├── modem_init — AT, ATE0, CMEE, CSCS, CLIP, CMGF, CPMS, CNMI,
+├── modem_init — AT, ATE0, CMEE, CSMP, CLIP, CMGF, CPMS, CNMI,
 │                CREG, CSDVC, CLVL, CSQ, COPS
 ├── modem_poll_signal — AT+CSQ → dBm + bars
 ├── modem_build_telemetry — signal + reg (always), operator +
@@ -119,7 +119,7 @@ Commands sent at startup, in order:
 | `AT` | Verify communication | Fatal if fails |
 | `ATE0` | Disable command echo | |
 | `AT+CMEE=2` | Verbose error messages | |
-| `AT+CSCS="GSM"` | Set GSM charset | SIM7600 defaults to UCS2 which breaks ASCII phone numbers |
+| `AT+CSMP=17,167,0,8` | SMS params with UCS2 DCS | DCS=8 tells network body is UCS2; enables emoji |
 | `AT+CLIP=1` | Enable caller ID | |
 | `AT+CMGF=1` | SMS text mode | |
 | `AT+CPMS="ME","ME","ME"` | SMS storage to modem memory | Default is "SR" (status reports) which causes read failures |
@@ -131,7 +131,8 @@ Commands sent at startup, in order:
 | `AT+COPS?` | Initial operator query | |
 
 SIM7600-specific discoveries during hardware testing:
-- `AT+CSCS="GSM"` required — modem defaults to UCS2 charset
+- Modem kept in default UCS2 charset — `AT+CSMP=17,167,0,8` sets DCS for UCS2 network encoding
+- Phone numbers and SMS bodies UCS2 hex-encoded for AT+CMGS, decoded from AT+CMGR. CLIP and ATD use plain ASCII.
 - `AT+CPMS="ME","ME","ME"` required — default SMS read storage is "SR"
 - `AT+CHUP` used for hangup instead of `ATH` — works in all call states
 - `AT+CECM=1` only works during active calls — sent per-call, not at init

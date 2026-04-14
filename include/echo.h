@@ -42,14 +42,16 @@
 #define ECHO_DEFAULT_RATE_SMS_H 20
 
 /* AT command limits */
-#define AT_RESPONSE_MAX 512
+#define AT_RESPONSE_MAX 4096    /* large enough for UCS2 hex SMS bodies */
 #define AT_TIMEOUT_DEFAULT 2000 /* ms */
 #define AT_TIMEOUT_SMS 60000    /* ms — AT+CMGS waits for network */
 #define AT_TIMEOUT_DIAL 5000    /* ms — ATD returns quickly, result comes as URC */
 
 /* SMS limits */
 #define SMS_BODY_MAX 800
+#define SMS_BODY_HEX_MAX 3200 /* UCS2 hex: up to 4x body length (8x for all emoji) */
 #define PHONE_NUMBER_MAX 20
+#define PHONE_NUMBER_HEX_MAX 80 /* UCS2 hex: 4 hex chars per digit */
 
 /* Call states (shared between modem.c and mqtt_comms.c) */
 typedef enum {

@@ -67,4 +67,29 @@ int sms_sanitize_body(const char *body, char *out, size_t out_size);
  */
 bool sms_sanitize_clip(const char *clip, char *out, size_t out_size);
 
+/**
+ * @brief Encode a UTF-8 string to UCS2 hex for AT+CMGS.
+ *
+ * Each character becomes 4 hex digits (UTF-16BE). Characters above U+FFFF
+ * are encoded as UTF-16 surrogate pairs (8 hex digits).
+ *
+ * @param utf8     Input UTF-8 string.
+ * @param hex_out  Output buffer for hex string.
+ * @param hex_size Size of hex output buffer.
+ * @return Length of hex string, or -1 on error.
+ */
+int sms_utf8_to_ucs2_hex(const char *utf8, char *hex_out, size_t hex_size);
+
+/**
+ * @brief Decode a UCS2 hex string to UTF-8.
+ *
+ * Handles UTF-16 surrogate pairs for characters above U+FFFF (emoji).
+ *
+ * @param hex      Input hex string (from modem response).
+ * @param utf8_out Output buffer for UTF-8 string.
+ * @param utf8_size Size of UTF-8 output buffer.
+ * @return Length of UTF-8 string, or -1 on error.
+ */
+int sms_ucs2_hex_to_utf8(const char *hex, char *utf8_out, size_t utf8_size);
+
 #endif /* SMS_H */

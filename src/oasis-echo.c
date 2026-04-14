@@ -308,12 +308,15 @@ static void handle_cmti(int sms_index) {
       return;
    }
 
-   /* Parse +CMGR response to extract sender and body */
-   char sender[PHONE_NUMBER_MAX + 1] = "";
-   const char *body = "";
+   /* Parse +CMGR response — in UCS2 mode, sender and body are hex-encoded.
+    * Format: +CMGR: "REC UNREAD","hex_sender","","timestamp"\nhex_body
+    * Extract hex substrings from resp.data, then decode to UTF-8. */
+   char sender_hex[PHONE_NUMBER_HEX_MAX + 1] = "";
+   const char *body_hex = ""; /* points into resp.data, no copy needed */
 
    const char *cmgr = strstr(resp.data, "+CMGR:");
    if (cmgr) {
+      /* Extract sender hex (second quoted string) */
       const char *q1 = strchr(cmgr, '"');
       if (q1) {
          q1 = strchr(q1 + 1, '"');
@@ -323,20 +326,35 @@ static void handle_cmti(int sms_index) {
                const char *q2 = strchr(q1 + 1, '"');
                if (q2) {
                   size_t len = (size_t)(q2 - q1 - 1);
-                  if (len > PHONE_NUMBER_MAX) {
-                     len = PHONE_NUMBER_MAX;
+                  if (len > PHONE_NUMBER_HEX_MAX) {
+                     len = PHONE_NUMBER_HEX_MAX;
                   }
-                  memcpy(sender, q1 + 1, len);
-                  sender[len] = '\0';
+                  memcpy(sender_hex, q1 + 1, len);
+                  sender_hex[len] = '\0';
                }
             }
          }
       }
+      /* Body hex is after the first newline — point directly into resp.data */
       const char *nl = strchr(cmgr, '\n');
       if (nl) {
-         body = nl + 1;
+         body_hex = nl + 1;
+      }
+      /* Trim trailing whitespace in resp.data (mutate OK, we own it) */
+      size_t blen = strlen(body_hex);
+      if (blen > 0) {
+         char *end = resp.data + (body_hex - resp.data) + blen;
+         while (end > body_hex && (*(end - 1) == '\n' || *(end - 1) == '\r' || *(end - 1) == ' ')) {
+            *(--end) = '\0';
+         }
       }
    }
+
+   /* Decode UCS2 hex to UTF-8 */
+   char sender[PHONE_NUMBER_MAX + 1] = "";
+   char body[SMS_BODY_MAX + 1] = "";
+   sms_ucs2_hex_to_utf8(sender_hex, sender, sizeof(sender));
+   sms_ucs2_hex_to_utf8(body_hex, body, sizeof(body));
 
    /* Build event using json-c for proper escaping */
    struct json_object *evt = json_object_new_object();
@@ -479,8 +497,22 @@ static void process_mqtt_command(const cmd_entry_t *cmd) {
          return;
       }
 
+      /* Encode number and body to UCS2 hex for AT+CMGS (modem uses UCS2 charset) */
+      char hex_number[PHONE_NUMBER_HEX_MAX + 1];
+      if (sms_utf8_to_ucs2_hex(value, hex_number, sizeof(hex_number)) < 0) {
+         mqtt_publish_response(action, request_id, false, NULL, "ENCODE_ERROR",
+                               "Failed to encode phone number");
+         return;
+      }
+      char hex_body[SMS_BODY_HEX_MAX + 1];
+      if (sms_utf8_to_ucs2_hex(clean, hex_body, sizeof(hex_body)) < 0) {
+         mqtt_publish_response(action, request_id, false, NULL, "ENCODE_ERROR",
+                               "Failed to encode SMS body");
+         return;
+      }
+
       at_response_t resp;
-      at_status_t rc = at_command_send_sms(&g_at_ctx, value, clean, &resp);
+      at_status_t rc = at_command_send_sms(&g_at_ctx, hex_number, hex_body, &resp);
       if (rc == AT_OK) {
          mqtt_publish_response(action, request_id, true, NULL, NULL, NULL);
       } else {

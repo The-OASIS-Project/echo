@@ -156,7 +156,8 @@ ctest --test-dir build --output-on-failure
 
 Discoveries from live hardware testing:
 
-- `AT+CSCS="GSM"` required at init — modem defaults to UCS2 charset which breaks ASCII phone numbers
+- Modem kept in default UCS2 charset — `AT+CSMP=17,167,0,8` sets DCS=8 to tell the network body is UCS2-encoded. Enables full Unicode/emoji SMS.
+- Phone numbers and SMS bodies are UCS2 hex-encoded for `AT+CMGS` and decoded from `AT+CMGR` responses. CLIP and ATD use plain ASCII.
 - `AT+CPMS="ME","ME","ME"` required — default SMS read storage is "SR" (status reports)
 - `AT+CHUP` for hangup instead of `ATH` — works reliably in all call states
 - `AT+CECM=1` only works during active calls — sent per-call, not at init

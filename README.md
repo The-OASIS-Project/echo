@@ -7,7 +7,7 @@ Part of [The OASIS Project](https://github.com/The-OASIS-Project/).
 ## What It Does
 
 - **Phone calls**: Dial, answer, hang up, DTMF tones, call state tracking
-- **SMS**: Send, receive, read, delete — with AT command injection prevention
+- **SMS**: Send, receive, read, delete — full Unicode/emoji support (UCS2), AT command injection prevention
 - **Telemetry**: Signal strength, network registration, operator, call state — published every 10 seconds
 - **Health monitoring**: Heartbeat checks, modem lost/reconnected events
 - **Rate limiting**: 5 calls/hour, 20 SMS/hour (configurable, defense in depth)
