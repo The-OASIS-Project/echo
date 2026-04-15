@@ -191,15 +191,13 @@ static void on_urc_event(const urc_event_t *event, void *userdata) {
             break;
          }
          set_call_state(CALL_STATE_RINGING_IN);
-         char extra[256];
-         if (event->number[0] != '\0') {
-            snprintf(extra, sizeof(extra), "\"number\":\"%s\"", event->number);
-         } else {
-            snprintf(extra, sizeof(extra), "\"number\":\"\"");
-         }
+         struct json_object *extra = json_object_new_object();
+         json_object_object_add(extra, "number",
+                                json_object_new_string(event->number[0] ? event->number : ""));
          if (mqtt_build_event_json("incoming_call", extra, json, sizeof(json)) >= 0) {
             mqtt_publish_event(json);
          }
+         json_object_put(extra);
          OLOG_INFO("Incoming call from: %s", event->number[0] ? event->number : "(blocked)");
          break;
       }
@@ -227,11 +225,12 @@ static void on_urc_event(const urc_event_t *event, void *userdata) {
          }
          set_call_state(CALL_STATE_IDLE);
          const char *reason = (prev == CALL_STATE_DIALING) ? "no_carrier" : "remote_hangup";
-         char extra[128];
-         snprintf(extra, sizeof(extra), "\"reason\":\"%s\"", reason);
+         struct json_object *extra = json_object_new_object();
+         json_object_object_add(extra, "reason", json_object_new_string(reason));
          if (mqtt_build_event_json("call_ended", extra, json, sizeof(json)) >= 0) {
             mqtt_publish_event(json);
          }
+         json_object_put(extra);
          OLOG_INFO("Call ended: %s", reason);
          break;
       }
@@ -241,8 +240,13 @@ static void on_urc_event(const urc_event_t *event, void *userdata) {
             break;
          }
          set_call_state(CALL_STATE_IDLE);
-         if (mqtt_build_event_json("call_ended", "\"reason\":\"busy\"", json, sizeof(json)) >= 0) {
-            mqtt_publish_event(json);
+         {
+            struct json_object *extra = json_object_new_object();
+            json_object_object_add(extra, "reason", json_object_new_string("busy"));
+            if (mqtt_build_event_json("call_ended", extra, json, sizeof(json)) >= 0) {
+               mqtt_publish_event(json);
+            }
+            json_object_put(extra);
          }
          OLOG_INFO("Call ended: busy");
          break;
@@ -252,9 +256,13 @@ static void on_urc_event(const urc_event_t *event, void *userdata) {
             break;
          }
          set_call_state(CALL_STATE_IDLE);
-         if (mqtt_build_event_json("call_ended", "\"reason\":\"no_answer\"", json, sizeof(json)) >=
-             0) {
-            mqtt_publish_event(json);
+         {
+            struct json_object *extra = json_object_new_object();
+            json_object_object_add(extra, "reason", json_object_new_string("no_answer"));
+            if (mqtt_build_event_json("call_ended", extra, json, sizeof(json)) >= 0) {
+               mqtt_publish_event(json);
+            }
+            json_object_put(extra);
          }
          OLOG_INFO("Call ended: no answer");
          break;
@@ -264,9 +272,13 @@ static void on_urc_event(const urc_event_t *event, void *userdata) {
             break;
          }
          set_call_state(CALL_STATE_IDLE);
-         if (mqtt_build_event_json("call_ended", "\"reason\":\"voice_call_end\"", json,
-                                   sizeof(json)) >= 0) {
-            mqtt_publish_event(json);
+         {
+            struct json_object *extra = json_object_new_object();
+            json_object_object_add(extra, "reason", json_object_new_string("voice_call_end"));
+            if (mqtt_build_event_json("call_ended", extra, json, sizeof(json)) >= 0) {
+               mqtt_publish_event(json);
+            }
+            json_object_put(extra);
          }
          OLOG_INFO("Call ended (VOICE CALL: END)");
          break;
@@ -356,14 +368,19 @@ static void handle_cmti(int sms_index) {
    sms_ucs2_hex_to_utf8(sender_hex, sender, sizeof(sender));
    sms_ucs2_hex_to_utf8(body_hex, body, sizeof(body));
 
-   /* Build event using json-c for proper escaping */
+   /* Build event using json-c for proper escaping (OCP v1.4) */
+   struct timespec ts;
+   clock_gettime(CLOCK_REALTIME, &ts);
+   int64_t timestamp_ms = (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+
    struct json_object *evt = json_object_new_object();
    json_object_object_add(evt, "device", json_object_new_string("echo"));
+   json_object_object_add(evt, "msg_type", json_object_new_string("event"));
    json_object_object_add(evt, "event", json_object_new_string("sms_received"));
    json_object_object_add(evt, "index", json_object_new_int(sms_index));
    json_object_object_add(evt, "sender", json_object_new_string(sender));
    json_object_object_add(evt, "body", json_object_new_string(body));
-   json_object_object_add(evt, "timestamp", json_object_new_int64((int64_t)time(NULL)));
+   json_object_object_add(evt, "timestamp", json_object_new_int64(timestamp_ms));
 
    const char *json_str = json_object_to_json_string(evt);
    mqtt_publish_event(json_str);

@@ -19,12 +19,13 @@
  * part of the project and are adopted by the project author(s).
  *
  * MQTT communications — connect, publish, subscribe, command dispatch.
- * All messages conform to OCP v1.3.
+ * All messages conform to OCP v1.4.
  */
 
 #ifndef MQTT_COMMS_H
 #define MQTT_COMMS_H
 
+#include <json-c/json.h>
 #include <stdbool.h>
 
 #include "at_command.h"
@@ -113,11 +114,20 @@ void mqtt_comms_cleanup(void);
 int mqtt_build_telemetry_json(const modem_telemetry_t *telem, char *buf, size_t size);
 
 /**
- * @brief Build an event JSON string.
+ * @brief Build an event JSON string (OCP v1.4).
+ *
+ * @param event_type  Event name (e.g., "incoming_call", "call_ended").
+ * @param extra       Additional fields to merge (NULL for none, caller retains ownership).
+ * @param buf         Output buffer.
+ * @param size        Buffer size.
+ * @return Length of JSON string, or -1 on error.
  *
  * Public for unit testing.
  */
-int mqtt_build_event_json(const char *event_type, const char *extra_fields, char *buf, size_t size);
+int mqtt_build_event_json(const char *event_type,
+                          struct json_object *extra,
+                          char *buf,
+                          size_t size);
 
 /**
  * @brief Build a response JSON string.

@@ -19,7 +19,7 @@
  * part of the project and are adopted by the project author(s).
  *
  * MQTT communications — publish telemetry/events/responses,
- * subscribe to commands, OCP v1.3 JSON formatting.
+ * subscribe to commands, OCP v1.4 JSON formatting.
  */
 
 #include "mqtt_comms.h"
@@ -68,7 +68,9 @@ static const char *sim_status_names[] = {
 /* ── Timestamp ───────────────────────────────────────────────────────── */
 
 static int64_t get_timestamp(void) {
-   return (int64_t)time(NULL);
+   struct timespec ts;
+   clock_gettime(CLOCK_REALTIME, &ts);
+   return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
 }
 
 /* ── JSON builders (public for testing) ──────────────────────────────── */
@@ -89,6 +91,7 @@ int mqtt_build_telemetry_json(const modem_telemetry_t *telem, char *buf, size_t 
 
    struct json_object *obj = json_object_new_object();
    json_object_object_add(obj, "device", json_object_new_string("echo"));
+   json_object_object_add(obj, "msg_type", json_object_new_string("telemetry"));
    json_object_object_add(obj, "signal_dbm", json_object_new_int(telem->signal_dbm));
    json_object_object_add(obj, "signal_bars", json_object_new_int(telem->signal_bars));
    json_object_object_add(obj, "csq", json_object_new_int(telem->csq));
@@ -112,24 +115,37 @@ int mqtt_build_telemetry_json(const modem_telemetry_t *telem, char *buf, size_t 
 }
 
 int mqtt_build_event_json(const char *event_type,
-                          const char *extra_fields,
+                          struct json_object *extra,
                           char *buf,
                           size_t size) {
    if (!event_type || !buf || size == 0) {
       return -1;
    }
 
-   int len;
-   if (extra_fields && extra_fields[0] != '\0') {
-      len = snprintf(buf, size,
-                     "{\"device\":\"echo\",\"event\":\"%s\",%s,\"timestamp\":%" PRId64 "}",
-                     event_type, extra_fields, get_timestamp());
-   } else {
-      len = snprintf(buf, size, "{\"device\":\"echo\",\"event\":\"%s\",\"timestamp\":%" PRId64 "}",
-                     event_type, get_timestamp());
+   struct json_object *obj = json_object_new_object();
+   json_object_object_add(obj, "device", json_object_new_string("echo"));
+   json_object_object_add(obj, "msg_type", json_object_new_string("event"));
+   json_object_object_add(obj, "event", json_object_new_string(event_type));
+
+   /* Merge extra fields (caller retains ownership) */
+   if (extra) {
+      json_object_object_foreach(extra, key, val) {
+         json_object_object_add(obj, key, json_object_get(val));
+      }
    }
 
-   return (len > 0 && (size_t)len < size) ? len : -1;
+   json_object_object_add(obj, "timestamp", json_object_new_int64(get_timestamp()));
+
+   const char *json_str = json_object_to_json_string(obj);
+   int len = (int)strlen(json_str);
+   if (len <= 0 || (size_t)len >= size) {
+      json_object_put(obj);
+      return -1;
+   }
+   memcpy(buf, json_str, (size_t)len + 1);
+   json_object_put(obj);
+
+   return len;
 }
 
 int mqtt_build_response_json(const char *action,
@@ -331,9 +347,17 @@ int mqtt_comms_init(const echo_config_t *config, mqtt_cmd_handler_t handler, voi
       OLOG_INFO("MQTT: TLS enabled (CA: %s)", ca ? ca : "system");
    }
 
-   /* Last Will and Testament — offline status */
-   const char *lwt = "{\"device\":\"echo\",\"status\":\"offline\"}";
-   mosquitto_will_set(mosq, MQTT_TOPIC_STATUS, (int)strlen(lwt), lwt, 1, true);
+   /* Last Will and Testament — offline status (timestamp:0 since broker sends it) */
+   struct json_object *lwt_obj = json_object_new_object();
+   if (lwt_obj) {
+      json_object_object_add(lwt_obj, "device", json_object_new_string("echo"));
+      json_object_object_add(lwt_obj, "msg_type", json_object_new_string("status"));
+      json_object_object_add(lwt_obj, "status", json_object_new_string("offline"));
+      json_object_object_add(lwt_obj, "timestamp", json_object_new_int64(0));
+      const char *lwt_str = json_object_to_json_string(lwt_obj);
+      mosquitto_will_set(mosq, MQTT_TOPIC_STATUS, (int)strlen(lwt_str), lwt_str, 1, true);
+      json_object_put(lwt_obj);
+   }
 
    /* Connect */
    int rc = mosquitto_connect(mosq, config->mqtt_host, config->mqtt_port, 60);
@@ -405,16 +429,37 @@ int mqtt_publish_status_online(void) {
       return -1;
    }
 
-   const char *payload = "{\"device\":\"echo\",\"status\":\"online\"}";
-   return mosquitto_publish(mosq, NULL, MQTT_TOPIC_STATUS, (int)strlen(payload), payload, 1, true);
+   struct json_object *obj = json_object_new_object();
+   if (!obj) {
+      return -1;
+   }
+   json_object_object_add(obj, "device", json_object_new_string("echo"));
+   json_object_object_add(obj, "msg_type", json_object_new_string("status"));
+   json_object_object_add(obj, "status", json_object_new_string("online"));
+   json_object_object_add(obj, "timestamp", json_object_new_int64(get_timestamp()));
+
+   const char *json_str = json_object_to_json_string(obj);
+   int rc = mosquitto_publish(mosq, NULL, MQTT_TOPIC_STATUS, (int)strlen(json_str), json_str, 1,
+                              true);
+   json_object_put(obj);
+   return rc;
 }
 
 void mqtt_comms_cleanup(void) {
    if (mosq) {
       if (mqtt_initialized) {
          /* Publish offline before disconnecting */
-         const char *offline = "{\"device\":\"echo\",\"status\":\"offline\"}";
-         mosquitto_publish(mosq, NULL, MQTT_TOPIC_STATUS, (int)strlen(offline), offline, 1, true);
+         struct json_object *obj = json_object_new_object();
+         if (obj) {
+            json_object_object_add(obj, "device", json_object_new_string("echo"));
+            json_object_object_add(obj, "msg_type", json_object_new_string("status"));
+            json_object_object_add(obj, "status", json_object_new_string("offline"));
+            json_object_object_add(obj, "timestamp", json_object_new_int64(get_timestamp()));
+            const char *json_str = json_object_to_json_string(obj);
+            mosquitto_publish(mosq, NULL, MQTT_TOPIC_STATUS, (int)strlen(json_str), json_str, 1,
+                              true);
+            json_object_put(obj);
+         }
 
          mosquitto_disconnect(mosq);
          mosquitto_loop_stop(mosq, false);

@@ -116,8 +116,10 @@ void test_event_json_simple(void) {
 
 void test_event_json_with_extra(void) {
    char buf[512];
-   int len = mqtt_build_event_json("incoming_call", "\"number\":\"+15551234567\"", buf,
-                                   sizeof(buf));
+   struct json_object *extra = json_object_new_object();
+   json_object_object_add(extra, "number", json_object_new_string("+15551234567"));
+   int len = mqtt_build_event_json("incoming_call", extra, buf, sizeof(buf));
+   json_object_put(extra);
    TEST_ASSERT_GREATER_THAN(0, len);
 
    struct json_object *root = parse_and_check(buf);
