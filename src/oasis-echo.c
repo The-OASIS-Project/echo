@@ -49,6 +49,12 @@ static rate_bucket_t g_sms_bucket;
 /* Thread-safe call state using __atomic builtins (GCC) */
 static call_state_t g_call_state = CALL_STATE_IDLE;
 
+/* Ring timeout: if RINGING_IN persists this long after the last RING URC,
+ * poll AT+CLCC to confirm. Modem sends RING every ~5s, so 10s gap means
+ * the carrier forwarded to voicemail without a termination URC. */
+#define RING_TIMEOUT_SEC 10
+static time_t g_last_ring_time = 0;
+
 static call_state_t get_call_state(void) {
    return __atomic_load_n(&g_call_state, __ATOMIC_ACQUIRE);
 }
@@ -186,8 +192,12 @@ static void on_urc_event(const urc_event_t *event, void *userdata) {
 
    switch (event->type) {
       case URC_RING: {
-         /* Suppress duplicate RING events — only publish on first RING */
+         g_last_ring_time = time(NULL);
+         /* Subsequent RINGs — publish lightweight ring event for MIRAGE/DAWN */
          if (get_call_state() == CALL_STATE_RINGING_IN) {
+            if (mqtt_build_event_json("ring", NULL, json, sizeof(json)) >= 0) {
+               mqtt_publish_event(json);
+            }
             break;
          }
          set_call_state(CALL_STATE_RINGING_IN);
@@ -224,6 +234,7 @@ static void on_urc_event(const urc_event_t *event, void *userdata) {
             break;
          }
          set_call_state(CALL_STATE_IDLE);
+         g_last_ring_time = 0;
          const char *reason = (prev == CALL_STATE_DIALING) ? "no_carrier" : "remote_hangup";
          struct json_object *extra = json_object_new_object();
          json_object_object_add(extra, "reason", json_object_new_string(reason));
@@ -285,7 +296,18 @@ static void on_urc_event(const urc_event_t *event, void *userdata) {
 
       case URC_CMTI: {
          /* Defer SMS read to main thread — calling at_command_send from
-          * the URC reader would deadlock (reader waits for itself). */
+          * the URC reader would deadlock (reader waits for itself).
+          * Deduplicate: SIM7600 sometimes sends duplicate +CMTI for same index. */
+         static int last_cmti_index = -1;
+         static time_t last_cmti_time = 0;
+         time_t now_t = time(NULL);
+         if (event->index == last_cmti_index && (now_t - last_cmti_time) < 3) {
+            OLOG_INFO("Suppressing duplicate CMTI for index %d", event->index);
+            break;
+         }
+         last_cmti_index = event->index;
+         last_cmti_time = now_t;
+
          OLOG_INFO("New SMS at index %d, deferring read to main loop", event->index);
          cmd_entry_t cmd;
          memset(&cmd, 0, sizeof(cmd));
@@ -467,12 +489,27 @@ static void process_mqtt_command(const cmd_entry_t *cmd) {
 
    /* hangup — AT+CHUP works in all call states on SIM7600 (ATH does not) */
    if (strcmp(action, "hangup") == 0) {
+      call_state_t prev = get_call_state();
       set_call_state(CALL_STATE_HANGING_UP);
       at_response_t resp;
       at_status_t rc = at_command_send(&g_at_ctx, "AT+CHUP", &resp, AT_TIMEOUT_DEFAULT);
       set_call_state(CALL_STATE_IDLE);
+      g_last_ring_time = 0;
       if (rc == AT_OK) {
          mqtt_publish_response(action, request_id, true, NULL, NULL, NULL);
+         /* Publish call_ended directly — don't rely on URC which we'll suppress
+          * since state is already IDLE by the time it arrives. */
+         if (prev != CALL_STATE_IDLE) {
+            char json[1024];
+            struct json_object *extra = json_object_new_object();
+            json_object_object_add(extra, "reason", json_object_new_string("local_hangup"));
+            json_object_object_add(extra, "duration", json_object_new_int(0));
+            if (mqtt_build_event_json("call_ended", extra, json, sizeof(json)) >= 0) {
+               mqtt_publish_event(json);
+            }
+            json_object_put(extra);
+            OLOG_INFO("Call ended: local hangup");
+         }
       } else {
          mqtt_publish_response(action, request_id, false, NULL, at_status_str(rc), "Hangup failed");
       }
@@ -860,6 +897,36 @@ int main(int argc, char *argv[]) {
             process_mqtt_command(&cmd);
          }
          last_at_success = time(NULL);
+      }
+
+      /* Ring timeout watchdog — if ringing for too long without a termination URC,
+       * poll the modem to confirm call state before transitioning to idle. */
+      if (get_call_state() == CALL_STATE_RINGING_IN && g_last_ring_time > 0 &&
+          (now - g_last_ring_time) >= RING_TIMEOUT_SEC) {
+         /* Ask the modem if any calls are active (AT+CLCC lists current calls) */
+         at_response_t clcc_resp;
+         at_status_t clcc_rc = at_command_send(&g_at_ctx, "AT+CLCC", &clcc_resp, 3000);
+         if (clcc_rc == AT_OK && strstr(clcc_resp.data, "+CLCC:") == NULL) {
+            /* Modem confirms no active calls — carrier forwarded to voicemail */
+            set_call_state(CALL_STATE_IDLE);
+            g_last_ring_time = 0;
+            char json[1024];
+            struct json_object *extra = json_object_new_object();
+            json_object_object_add(extra, "reason", json_object_new_string("ring_timeout"));
+            if (mqtt_build_event_json("call_ended", extra, json, sizeof(json)) >= 0) {
+               mqtt_publish_event(json);
+            }
+            json_object_put(extra);
+            OLOG_INFO("Ring timeout: modem confirms no active calls after %ds", RING_TIMEOUT_SEC);
+         } else if (clcc_rc == AT_OK) {
+            /* Call still active on modem — extend the timeout */
+            g_last_ring_time = now;
+            OLOG_INFO("Ring timeout check: modem reports call still active, extending");
+         } else {
+            /* AT command failed — extend timeout, don't make assumptions */
+            g_last_ring_time = now;
+            OLOG_WARNING("Ring timeout check: AT+CLCC failed (rc=%d), extending", clcc_rc);
+         }
       }
 
       /* Telemetry polling */
