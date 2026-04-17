@@ -26,7 +26,9 @@
 #include <stdarg.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/time.h>
 #include <syslog.h>
+#include <time.h>
 
 static FILE *log_file = NULL;
 
@@ -37,6 +39,18 @@ static FILE *log_file = NULL;
 #define ANSI_COLOR_RESET "\x1b[0m"
 
 static int use_syslog = 0;
+
+/* Get current timestamp with milliseconds (thread-safe) */
+static void get_timestamp_ms(char *buffer, size_t buffer_size) {
+   struct timeval tv;
+   struct tm tm_storage;
+
+   gettimeofday(&tv, NULL);
+   localtime_r(&tv.tv_sec, &tm_storage);
+
+   snprintf(buffer, buffer_size, "%02d:%02d:%02d.%03d", tm_storage.tm_hour, tm_storage.tm_min,
+            tm_storage.tm_sec, (int)(tv.tv_usec / 1000));
+}
 
 int init_syslog(const char *ident) {
    if (log_file) {
@@ -56,7 +70,7 @@ static const char *get_filename(const char *path) {
    return filename ? filename + 1 : path;
 }
 
-#define PREAMBLE_WIDTH 35
+#define PREAMBLE_WIDTH 45
 
 static void remove_newlines(char *str) {
    char *src = str, *dst = str;
@@ -107,9 +121,12 @@ void log_message(log_level_t level, const char *file, int line, const char *fmt,
 
    const char *filename = get_filename(file);
 
+   char timestamp[13]; /* "HH:MM:SS.mmm" */
+   get_timestamp_ms(timestamp, sizeof(timestamp));
+
    char preamble[PREAMBLE_WIDTH + 1];
-   int preamble_length = snprintf(preamble, sizeof(preamble), "[%s] %s:%d: ", level_str, filename,
-                                  line);
+   int preamble_length = snprintf(preamble, sizeof(preamble), "[%s] %s %s:%d: ", level_str,
+                                  timestamp, filename, line);
 
    if (preamble_length > PREAMBLE_WIDTH) {
       preamble[PREAMBLE_WIDTH] = '\0';
