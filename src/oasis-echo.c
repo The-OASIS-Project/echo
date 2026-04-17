@@ -63,6 +63,14 @@ static void set_call_state(call_state_t state) {
    __atomic_store_n(&g_call_state, state, __ATOMIC_RELEASE);
 }
 
+static time_t get_last_ring_time(void) {
+   return __atomic_load_n(&g_last_ring_time, __ATOMIC_ACQUIRE);
+}
+
+static void set_last_ring_time(time_t t) {
+   __atomic_store_n(&g_last_ring_time, t, __ATOMIC_RELEASE);
+}
+
 /* ── Command queue (thread-safe, lock-free SPSC ring) ────────────────── */
 
 #define CMD_QUEUE_SIZE 16
@@ -192,7 +200,7 @@ static void on_urc_event(const urc_event_t *event, void *userdata) {
 
    switch (event->type) {
       case URC_RING: {
-         g_last_ring_time = time(NULL);
+         set_last_ring_time(time(NULL));
          /* Subsequent RINGs — publish lightweight ring event for MIRAGE/DAWN */
          if (get_call_state() == CALL_STATE_RINGING_IN) {
             if (mqtt_build_event_json("ring", NULL, json, sizeof(json)) >= 0) {
@@ -234,7 +242,7 @@ static void on_urc_event(const urc_event_t *event, void *userdata) {
             break;
          }
          set_call_state(CALL_STATE_IDLE);
-         g_last_ring_time = 0;
+         set_last_ring_time(0);
          const char *reason = (prev == CALL_STATE_DIALING) ? "no_carrier" : "remote_hangup";
          struct json_object *extra = json_object_new_object();
          json_object_object_add(extra, "reason", json_object_new_string(reason));
@@ -494,8 +502,9 @@ static void process_mqtt_command(const cmd_entry_t *cmd) {
       at_response_t resp;
       at_status_t rc = at_command_send(&g_at_ctx, "AT+CHUP", &resp, AT_TIMEOUT_DEFAULT);
       set_call_state(CALL_STATE_IDLE);
-      g_last_ring_time = 0;
-      if (rc == AT_OK) {
+      set_last_ring_time(0);
+      /* AT+CHUP may return OK or NO CARRIER — both mean the call ended */
+      if (rc == AT_OK || rc == AT_NO_CARRIER) {
          mqtt_publish_response(action, request_id, true, NULL, NULL, NULL);
          /* Publish call_ended directly — don't rely on URC which we'll suppress
           * since state is already IDLE by the time it arrives. */
@@ -901,15 +910,16 @@ int main(int argc, char *argv[]) {
 
       /* Ring timeout watchdog — if ringing for too long without a termination URC,
        * poll the modem to confirm call state before transitioning to idle. */
-      if (get_call_state() == CALL_STATE_RINGING_IN && g_last_ring_time > 0 &&
-          (now - g_last_ring_time) >= RING_TIMEOUT_SEC) {
+      time_t last_ring = get_last_ring_time();
+      if (get_call_state() == CALL_STATE_RINGING_IN && last_ring > 0 &&
+          (now - last_ring) >= RING_TIMEOUT_SEC) {
          /* Ask the modem if any calls are active (AT+CLCC lists current calls) */
          at_response_t clcc_resp;
          at_status_t clcc_rc = at_command_send(&g_at_ctx, "AT+CLCC", &clcc_resp, 3000);
          if (clcc_rc == AT_OK && strstr(clcc_resp.data, "+CLCC:") == NULL) {
             /* Modem confirms no active calls — carrier forwarded to voicemail */
             set_call_state(CALL_STATE_IDLE);
-            g_last_ring_time = 0;
+            set_last_ring_time(0);
             char json[1024];
             struct json_object *extra = json_object_new_object();
             json_object_object_add(extra, "reason", json_object_new_string("ring_timeout"));
@@ -920,11 +930,11 @@ int main(int argc, char *argv[]) {
             OLOG_INFO("Ring timeout: modem confirms no active calls after %ds", RING_TIMEOUT_SEC);
          } else if (clcc_rc == AT_OK) {
             /* Call still active on modem — extend the timeout */
-            g_last_ring_time = now;
+            set_last_ring_time(now);
             OLOG_INFO("Ring timeout check: modem reports call still active, extending");
          } else {
             /* AT command failed — extend timeout, don't make assumptions */
-            g_last_ring_time = now;
+            set_last_ring_time(now);
             OLOG_WARNING("Ring timeout check: AT+CLCC failed (rc=%d), extending", clcc_rc);
          }
       }
