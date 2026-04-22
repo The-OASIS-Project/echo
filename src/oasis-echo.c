@@ -37,6 +37,8 @@
 #include "modem.h"
 #include "mqtt_comms.h"
 #include "sms.h"
+#include "sms_io.h"
+#include "sms_reassembly.h"
 #include "urc_handler.h"
 
 /* ── Globals ─────────────────────────────────────────────────────────── */
@@ -45,6 +47,8 @@ static volatile sig_atomic_t g_running = 1;
 static at_context_t g_at_ctx;
 static rate_bucket_t g_call_bucket;
 static rate_bucket_t g_sms_bucket;
+static rate_bucket_t g_segment_bucket;
+static sms_io_ctx_t g_sms_io;
 
 /* Thread-safe call state using __atomic builtins (GCC) */
 static call_state_t g_call_state = CALL_STATE_IDLE;
@@ -96,7 +100,14 @@ typedef struct {
    volatile int tail; /* written by consumer */
 } cmd_queue_t;
 
+/* Two queues so MQTT commands always drain ahead of deferred events. A
+ * multi-segment SMS burst pushes up to 10 CMTIs onto the deferred queue;
+ * without this split, a newly-arrived hangup/dial would wait behind those
+ * CMGR+CMGD operations (several seconds in the worst case). Both queues
+ * are single-producer / single-consumer: MQTT thread → g_cmd_queue; URC
+ * reader thread → g_deferred_queue; both consumed by main. */
 static cmd_queue_t g_cmd_queue;
+static cmd_queue_t g_deferred_queue;
 
 static void cmd_queue_init(cmd_queue_t *q) {
    memset(q, 0, sizeof(*q));
@@ -133,35 +144,38 @@ static void signal_handler(int sig) {
 void rate_bucket_init(rate_bucket_t *bucket, int max_per_hour) {
    memset(bucket, 0, sizeof(*bucket));
    bucket->max_per_hour = max_per_hour;
+   bucket->tokens = (double)max_per_hour; /* start full */
+   bucket->last_refill_sec = (int64_t)time(NULL);
+}
+
+static void rate_bucket_refill(rate_bucket_t *bucket) {
+   int64_t now = (int64_t)time(NULL);
+   int64_t elapsed = now - bucket->last_refill_sec;
+   if (elapsed <= 0) {
+      return;
+   }
+   double add = (double)elapsed * (double)bucket->max_per_hour / 3600.0;
+   bucket->tokens += add;
+   if (bucket->tokens > (double)bucket->max_per_hour) {
+      bucket->tokens = (double)bucket->max_per_hour;
+   }
+   bucket->last_refill_sec = now;
+}
+
+bool rate_bucket_take_n(rate_bucket_t *bucket, int n) {
+   if (!bucket || n <= 0) {
+      return false;
+   }
+   rate_bucket_refill(bucket);
+   if (bucket->tokens < (double)n) {
+      return false;
+   }
+   bucket->tokens -= (double)n;
+   return true;
 }
 
 bool rate_bucket_allow(rate_bucket_t *bucket) {
-   int64_t now = (int64_t)time(NULL);
-   int64_t window_start = now - 3600;
-
-   /* Count events in the last hour */
-   int active = 0;
-   for (int i = 0; i < bucket->count && i < 64; i++) {
-      if (bucket->timestamps[i] >= window_start) {
-         active++;
-      }
-   }
-
-   if (active >= bucket->max_per_hour) {
-      return false;
-   }
-
-   /* Record this event */
-   bucket->timestamps[bucket->head] = now;
-   bucket->head = (bucket->head + 1) % 64;
-   if (bucket->count < 64) {
-      bucket->count++;
-   }
-
-   /* Fix: keep count accurate as old entries expire */
-   bucket->count = active + 1;
-
-   return true;
+   return rate_bucket_take_n(bucket, 1);
 }
 
 /* ── Input validation helpers ────────────────────────────────────────── */
@@ -230,7 +244,7 @@ static void on_urc_event(const urc_event_t *event, void *userdata) {
          cmd_entry_t audio_cmd;
          memset(&audio_cmd, 0, sizeof(audio_cmd));
          audio_cmd.type = CMD_TYPE_CALL_CONNECTED;
-         cmd_queue_push(&g_cmd_queue, &audio_cmd);
+         cmd_queue_push(&g_deferred_queue, &audio_cmd);
          OLOG_INFO("Call connected");
          break;
       }
@@ -321,8 +335,8 @@ static void on_urc_event(const urc_event_t *event, void *userdata) {
          memset(&cmd, 0, sizeof(cmd));
          cmd.type = CMD_TYPE_CMTI;
          cmd.sms_index = event->index;
-         if (!cmd_queue_push(&g_cmd_queue, &cmd)) {
-            OLOG_WARNING("Command queue full, dropping CMTI event for index %d", event->index);
+         if (!cmd_queue_push(&g_deferred_queue, &cmd)) {
+            OLOG_WARNING("Deferred queue full, dropping CMTI event for index %d", event->index);
          }
          break;
       }
@@ -339,86 +353,7 @@ static void on_urc_event(const urc_event_t *event, void *userdata) {
 /* ── Deferred SMS read (runs on main thread) ─────────────────────────── */
 
 static void handle_cmti(int sms_index) {
-   OLOG_INFO("Reading SMS at index %d...", sms_index);
-   char cmd[32];
-   snprintf(cmd, sizeof(cmd), "AT+CMGR=%d", sms_index);
-   at_response_t resp;
-   at_status_t rc = at_command_send(&g_at_ctx, cmd, &resp, AT_TIMEOUT_DEFAULT);
-   if (rc != AT_OK) {
-      OLOG_WARNING("Failed to read SMS at index %d: %s (code=%d, data=[%s])", sms_index,
-                   at_status_str(rc), resp.error_code, resp.data);
-      return;
-   }
-
-   /* Parse +CMGR response — in UCS2 mode, sender and body are hex-encoded.
-    * Format: +CMGR: "REC UNREAD","hex_sender","","timestamp"\nhex_body
-    * Extract hex substrings from resp.data, then decode to UTF-8. */
-   char sender_hex[PHONE_NUMBER_HEX_MAX + 1] = "";
-   const char *body_hex = ""; /* points into resp.data, no copy needed */
-
-   const char *cmgr = strstr(resp.data, "+CMGR:");
-   if (cmgr) {
-      /* Extract sender hex (second quoted string) */
-      const char *q1 = strchr(cmgr, '"');
-      if (q1) {
-         q1 = strchr(q1 + 1, '"');
-         if (q1) {
-            q1 = strchr(q1 + 1, '"');
-            if (q1) {
-               const char *q2 = strchr(q1 + 1, '"');
-               if (q2) {
-                  size_t len = (size_t)(q2 - q1 - 1);
-                  if (len > PHONE_NUMBER_HEX_MAX) {
-                     len = PHONE_NUMBER_HEX_MAX;
-                  }
-                  memcpy(sender_hex, q1 + 1, len);
-                  sender_hex[len] = '\0';
-               }
-            }
-         }
-      }
-      /* Body hex is after the first newline — point directly into resp.data */
-      const char *nl = strchr(cmgr, '\n');
-      if (nl) {
-         body_hex = nl + 1;
-      }
-      /* Trim trailing whitespace in resp.data (mutate OK, we own it) */
-      size_t blen = strlen(body_hex);
-      if (blen > 0) {
-         char *end = resp.data + (body_hex - resp.data) + blen;
-         while (end > body_hex && (*(end - 1) == '\n' || *(end - 1) == '\r' || *(end - 1) == ' ')) {
-            *(--end) = '\0';
-         }
-      }
-   }
-
-   /* Decode UCS2 hex to UTF-8 */
-   char sender[PHONE_NUMBER_MAX + 1] = "";
-   char body[SMS_BODY_MAX + 1] = "";
-   sms_ucs2_hex_to_utf8(sender_hex, sender, sizeof(sender));
-   sms_ucs2_hex_to_utf8(body_hex, body, sizeof(body));
-
-   /* Build event using json-c for proper escaping (OCP v1.4) */
-   struct timespec ts;
-   clock_gettime(CLOCK_REALTIME, &ts);
-   int64_t timestamp_ms = (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
-
-   struct json_object *evt = json_object_new_object();
-   json_object_object_add(evt, "device", json_object_new_string("echo"));
-   json_object_object_add(evt, "msg_type", json_object_new_string("event"));
-   json_object_object_add(evt, "event", json_object_new_string("sms_received"));
-   json_object_object_add(evt, "index", json_object_new_int(sms_index));
-   json_object_object_add(evt, "sender", json_object_new_string(sender));
-   json_object_object_add(evt, "body", json_object_new_string(body));
-   json_object_object_add(evt, "timestamp", json_object_new_int64(timestamp_ms));
-
-   const char *json_str = json_object_to_json_string(evt);
-   mqtt_publish_event(json_str);
-   json_object_put(evt);
-
-   /* DAWN is responsible for sending delete_sms after committing to phone_db.
-    * If ECHO auto-deleted here and DAWN crashed before DB commit, the SMS
-    * would be lost. The index is included in the event for DAWN to reference. */
+   sms_io_handle_cmti(&g_sms_io, sms_index);
 }
 
 /* ── MQTT command handler (queues to main thread) ────────────────────── */
@@ -445,7 +380,7 @@ static void on_mqtt_command(const char *action,
    if (!cmd_queue_push(&g_cmd_queue, &cmd)) {
       OLOG_WARNING("Command queue full, rejecting action=%s request_id=%s", action, request_id);
       mqtt_publish_response(action, request_id, false, NULL, "QUEUE_FULL",
-                            "Command queue full, try again");
+                            "Command queue full, try again", NULL);
    }
 }
 
@@ -461,12 +396,12 @@ static void process_mqtt_command(const cmd_entry_t *cmd) {
    if (strcmp(action, "dial") == 0) {
       if (!sms_validate_number(value)) {
          mqtt_publish_response(action, request_id, false, NULL, "INVALID_NUMBER",
-                               "Phone number validation failed");
+                               "Phone number validation failed", NULL);
          return;
       }
       if (!rate_bucket_allow(&g_call_bucket)) {
          mqtt_publish_response(action, request_id, false, NULL, "RATE_LIMITED",
-                               "Call rate limit exceeded");
+                               "Call rate limit exceeded", NULL);
          return;
       }
 
@@ -475,10 +410,10 @@ static void process_mqtt_command(const cmd_entry_t *cmd) {
       at_status_t rc = at_command_send_async(&g_at_ctx, at_cmd);
       if (rc == AT_OK) {
          set_call_state(CALL_STATE_DIALING);
-         mqtt_publish_response(action, request_id, true, NULL, NULL, NULL);
+         mqtt_publish_response(action, request_id, true, NULL, NULL, NULL, NULL);
       } else {
          mqtt_publish_response(action, request_id, false, NULL, "AT_ERROR",
-                               "Failed to send dial command");
+                               "Failed to send dial command", NULL);
       }
       return;
    }
@@ -487,10 +422,10 @@ static void process_mqtt_command(const cmd_entry_t *cmd) {
    if (strcmp(action, "answer") == 0) {
       at_status_t rc = at_command_send_async(&g_at_ctx, "ATA");
       if (rc == AT_OK) {
-         mqtt_publish_response(action, request_id, true, NULL, NULL, NULL);
+         mqtt_publish_response(action, request_id, true, NULL, NULL, NULL, NULL);
       } else {
          mqtt_publish_response(action, request_id, false, NULL, "AT_ERROR",
-                               "Failed to send answer command");
+                               "Failed to send answer command", NULL);
       }
       return;
    }
@@ -505,7 +440,7 @@ static void process_mqtt_command(const cmd_entry_t *cmd) {
       set_last_ring_time(0);
       /* AT+CHUP may return OK or NO CARRIER — both mean the call ended */
       if (rc == AT_OK || rc == AT_NO_CARRIER) {
-         mqtt_publish_response(action, request_id, true, NULL, NULL, NULL);
+         mqtt_publish_response(action, request_id, true, NULL, NULL, NULL, NULL);
          /* Publish call_ended directly — don't rely on URC which we'll suppress
           * since state is already IDLE by the time it arrives. */
          if (prev != CALL_STATE_IDLE) {
@@ -520,25 +455,14 @@ static void process_mqtt_command(const cmd_entry_t *cmd) {
             OLOG_INFO("Call ended: local hangup");
          }
       } else {
-         mqtt_publish_response(action, request_id, false, NULL, at_status_str(rc), "Hangup failed");
+         mqtt_publish_response(action, request_id, false, NULL, at_status_str(rc), "Hangup failed",
+                               NULL);
       }
       return;
    }
 
-   /* send_sms */
+   /* send_sms — delegate encoding + transmission + response to sms_io. */
    if (strcmp(action, "send_sms") == 0) {
-      if (!sms_validate_number(value)) {
-         mqtt_publish_response(action, request_id, false, NULL, "INVALID_NUMBER",
-                               "Phone number validation failed");
-         return;
-      }
-      if (!rate_bucket_allow(&g_sms_bucket)) {
-         mqtt_publish_response(action, request_id, false, NULL, "RATE_LIMITED",
-                               "SMS rate limit exceeded");
-         return;
-      }
-
-      /* Extract body from data_json */
       char body[SMS_BODY_MAX + 1] = "";
       if (data_json[0] != '\0') {
          struct json_object *data = json_tokener_parse(data_json);
@@ -550,38 +474,7 @@ static void process_mqtt_command(const cmd_entry_t *cmd) {
             json_object_put(data);
          }
       }
-
-      /* Sanitize body */
-      char clean[SMS_BODY_MAX + 1];
-      int clean_len = sms_sanitize_body(body, clean, sizeof(clean));
-      if (clean_len < 0) {
-         mqtt_publish_response(action, request_id, false, NULL, "INVALID_BODY",
-                               "SMS body contains dangerous characters");
-         return;
-      }
-
-      /* Encode number and body to UCS2 hex for AT+CMGS (modem uses UCS2 charset) */
-      char hex_number[PHONE_NUMBER_HEX_MAX + 1];
-      if (sms_utf8_to_ucs2_hex(value, hex_number, sizeof(hex_number)) < 0) {
-         mqtt_publish_response(action, request_id, false, NULL, "ENCODE_ERROR",
-                               "Failed to encode phone number");
-         return;
-      }
-      char hex_body[SMS_BODY_HEX_MAX + 1];
-      if (sms_utf8_to_ucs2_hex(clean, hex_body, sizeof(hex_body)) < 0) {
-         mqtt_publish_response(action, request_id, false, NULL, "ENCODE_ERROR",
-                               "Failed to encode SMS body");
-         return;
-      }
-
-      at_response_t resp;
-      at_status_t rc = at_command_send_sms(&g_at_ctx, hex_number, hex_body, &resp);
-      if (rc == AT_OK) {
-         mqtt_publish_response(action, request_id, true, NULL, NULL, NULL);
-      } else {
-         mqtt_publish_response(action, request_id, false, NULL, at_status_str(rc),
-                               "SMS send failed");
-      }
+      sms_io_send_and_respond(&g_sms_io, value, body, action, request_id);
       return;
    }
 
@@ -590,7 +483,7 @@ static void process_mqtt_command(const cmd_entry_t *cmd) {
       long idx;
       if (!validate_sms_index(value, &idx)) {
          mqtt_publish_response(action, request_id, false, NULL, "INVALID_INDEX",
-                               "SMS index must be 0-999");
+                               "SMS index must be 0-999", NULL);
          return;
       }
       char at_cmd[32];
@@ -598,10 +491,10 @@ static void process_mqtt_command(const cmd_entry_t *cmd) {
       at_response_t resp;
       at_status_t rc = at_command_send(&g_at_ctx, at_cmd, &resp, AT_TIMEOUT_DEFAULT);
       if (rc == AT_OK) {
-         mqtt_publish_response(action, request_id, true, resp.data, NULL, NULL);
+         mqtt_publish_response(action, request_id, true, resp.data, NULL, NULL, NULL);
       } else {
          mqtt_publish_response(action, request_id, false, NULL, at_status_str(rc),
-                               "Failed to read SMS");
+                               "Failed to read SMS", NULL);
       }
       return;
    }
@@ -611,7 +504,7 @@ static void process_mqtt_command(const cmd_entry_t *cmd) {
       long idx;
       if (!validate_sms_index(value, &idx)) {
          mqtt_publish_response(action, request_id, false, NULL, "INVALID_INDEX",
-                               "SMS index must be 0-999");
+                               "SMS index must be 0-999", NULL);
          return;
       }
       char at_cmd[32];
@@ -619,10 +512,10 @@ static void process_mqtt_command(const cmd_entry_t *cmd) {
       at_response_t resp;
       at_status_t rc = at_command_send(&g_at_ctx, at_cmd, &resp, AT_TIMEOUT_DEFAULT);
       if (rc == AT_OK) {
-         mqtt_publish_response(action, request_id, true, NULL, NULL, NULL);
+         mqtt_publish_response(action, request_id, true, NULL, NULL, NULL, NULL);
       } else {
          mqtt_publish_response(action, request_id, false, NULL, at_status_str(rc),
-                               "Failed to delete SMS");
+                               "Failed to delete SMS", NULL);
       }
       return;
    }
@@ -635,11 +528,11 @@ static void process_mqtt_command(const cmd_entry_t *cmd) {
          json_object_object_add(val, "signal_dbm", json_object_new_int(dbm));
          json_object_object_add(val, "csq", json_object_new_int(csq));
          const char *val_str = json_object_to_json_string(val);
-         mqtt_publish_response(action, request_id, true, val_str, NULL, NULL);
+         mqtt_publish_response(action, request_id, true, val_str, NULL, NULL, NULL);
          json_object_put(val);
       } else {
          mqtt_publish_response(action, request_id, false, NULL, "SIGNAL_ERROR",
-                               "Failed to read signal");
+                               "Failed to read signal", NULL);
       }
       return;
    }
@@ -648,12 +541,12 @@ static void process_mqtt_command(const cmd_entry_t *cmd) {
    if (strcmp(action, "dtmf") == 0) {
       if (!value || value[0] == '\0') {
          mqtt_publish_response(action, request_id, false, NULL, "INVALID_VALUE",
-                               "DTMF digit required");
+                               "DTMF digit required", NULL);
          return;
       }
       if (!validate_dtmf(value[0])) {
          mqtt_publish_response(action, request_id, false, NULL, "INVALID_DTMF",
-                               "DTMF must be 0-9, *, #, A-D");
+                               "DTMF must be 0-9, *, #, A-D", NULL);
          return;
       }
       char at_cmd[32];
@@ -661,9 +554,10 @@ static void process_mqtt_command(const cmd_entry_t *cmd) {
       at_response_t resp;
       at_status_t rc = at_command_send(&g_at_ctx, at_cmd, &resp, AT_TIMEOUT_DEFAULT);
       if (rc == AT_OK) {
-         mqtt_publish_response(action, request_id, true, NULL, NULL, NULL);
+         mqtt_publish_response(action, request_id, true, NULL, NULL, NULL, NULL);
       } else {
-         mqtt_publish_response(action, request_id, false, NULL, at_status_str(rc), "DTMF failed");
+         mqtt_publish_response(action, request_id, false, NULL, at_status_str(rc), "DTMF failed",
+                               NULL);
       }
       return;
    }
@@ -673,18 +567,18 @@ static void process_mqtt_command(const cmd_entry_t *cmd) {
       at_response_t resp;
       at_status_t rc = at_command_send(&g_at_ctx, "AT+CLCC", &resp, AT_TIMEOUT_DEFAULT);
       if (rc == AT_OK) {
-         mqtt_publish_response(action, request_id, true, resp.data, NULL, NULL);
+         mqtt_publish_response(action, request_id, true, resp.data, NULL, NULL, NULL);
       } else {
          mqtt_publish_response(action, request_id, false, NULL, at_status_str(rc),
-                               "Call query failed");
+                               "Call query failed", NULL);
       }
       return;
    }
 
    /* Unknown action */
    OLOG_WARNING("Unknown command action: %s", action);
-   mqtt_publish_response(action, request_id, false, NULL, "UNKNOWN_ACTION",
-                         "Action not recognized");
+   mqtt_publish_response(action, request_id, false, NULL, "UNKNOWN_ACTION", "Action not recognized",
+                         NULL);
 }
 
 /* ── Usage / Version ─────────────────────────────────────────────────── */
@@ -708,6 +602,7 @@ static void print_usage(const char *prog) {
    printf("      --mqtt-password PASS MQTT password (or env MQTT_PASSWORD, preferred)\n");
    printf("      --mqtt-tls           Enable MQTT TLS\n");
    printf("      --mqtt-ca-cert PATH  CA certificate path (implies --mqtt-tls)\n");
+   printf("      --legacy-sms         Use legacy text-mode SMS (AT+CMGF=1), no concat\n");
    printf("  -e, --service            Run in service mode (syslog)\n");
    printf("  -h, --help               Show this help\n");
    printf("  -v, --version            Show version\n");
@@ -730,6 +625,9 @@ int main(int argc, char *argv[]) {
    config.telemetry_interval_s = ECHO_DEFAULT_TELEMETRY_S;
    config.rate_limit_calls_per_hour = ECHO_DEFAULT_RATE_CALLS_H;
    config.rate_limit_sms_per_hour = ECHO_DEFAULT_RATE_SMS_H;
+   config.rate_limit_segments_per_hour = ECHO_DEFAULT_RATE_SEGMENTS_H;
+   config.inter_segment_delay_ms = ECHO_DEFAULT_SEGMENT_DELAY_MS;
+   config.pdu_mode = true;
    config.service_mode = false;
 
    /* Environment variable overrides (for systemd EnvironmentFile) */
@@ -767,6 +665,15 @@ int main(int argc, char *argv[]) {
    if ((env = getenv("RATE_LIMIT_SMS_PER_HOUR"))) {
       config.rate_limit_sms_per_hour = atoi(env);
    }
+   if ((env = getenv("RATE_LIMIT_SEGMENTS_PER_HOUR"))) {
+      config.rate_limit_segments_per_hour = atoi(env);
+   }
+   if ((env = getenv("INTER_SEGMENT_DELAY_MS"))) {
+      config.inter_segment_delay_ms = atoi(env);
+   }
+   if ((env = getenv("PDU_MODE"))) {
+      config.pdu_mode = !(strcmp(env, "0") == 0 || strcmp(env, "false") == 0);
+   }
 
    /* Command-line overrides */
    static struct option long_options[] = {
@@ -778,6 +685,7 @@ int main(int argc, char *argv[]) {
       { "mqtt-password", required_argument, 0, 1001 },
       { "mqtt-tls", no_argument, 0, 1002 },
       { "mqtt-ca-cert", required_argument, 0, 1003 },
+      { "legacy-sms", no_argument, 0, 1004 },
       { "service", no_argument, 0, 'e' },
       { "help", no_argument, 0, 'h' },
       { "version", no_argument, 0, 'v' },
@@ -812,6 +720,9 @@ int main(int argc, char *argv[]) {
             snprintf(config.mqtt_ca_cert, sizeof(config.mqtt_ca_cert), "%s", optarg);
             config.mqtt_tls = 1;
             break;
+         case 1004:
+            config.pdu_mode = false;
+            break;
          case 'e':
             config.service_mode = true;
             break;
@@ -842,10 +753,19 @@ int main(int argc, char *argv[]) {
    signal(SIGINT, signal_handler);
    signal(SIGTERM, signal_handler);
 
-   /* Init command queue and rate limiters */
+   /* Init command queues and rate limiters */
    cmd_queue_init(&g_cmd_queue);
+   cmd_queue_init(&g_deferred_queue);
    rate_bucket_init(&g_call_bucket, config.rate_limit_calls_per_hour);
    rate_bucket_init(&g_sms_bucket, config.rate_limit_sms_per_hour);
+   rate_bucket_init(&g_segment_bucket, config.rate_limit_segments_per_hour);
+   sms_reassembly_reset();
+
+   g_sms_io.at = &g_at_ctx;
+   g_sms_io.msg_bucket = &g_sms_bucket;
+   g_sms_io.segment_bucket = &g_segment_bucket;
+   g_sms_io.inter_segment_delay_ms = config.inter_segment_delay_ms;
+   g_sms_io.pdu_mode = config.pdu_mode;
 
    /* Open serial port */
    if (at_open(&g_at_ctx, config.serial_port, config.serial_baud) != 0) {
@@ -864,7 +784,7 @@ int main(int argc, char *argv[]) {
    }
 
    /* Run modem init sequence */
-   if (modem_init(&g_at_ctx) != 0) {
+   if (modem_init(&g_at_ctx, config.pdu_mode) != 0) {
       OLOG_ERROR("Modem init failed — exiting");
       urc_stop(&urc_ctx);
       at_close(&g_at_ctx);
@@ -895,17 +815,32 @@ int main(int argc, char *argv[]) {
    while (g_running) {
       time_t now = time(NULL);
 
-      /* Drain command queue (MQTT commands + deferred events) */
+      /* Drain MQTT commands first so a newly-arrived hangup/dial never waits
+       * behind a queued CMTI burst (a 10-segment inbound SMS generates 10
+       * CMTIs, each holding the main thread for a CMGR+CMGD round-trip). */
       cmd_entry_t cmd;
       while (cmd_queue_pop(&g_cmd_queue, &cmd)) {
+         process_mqtt_command(&cmd);
+         last_at_success = time(NULL);
+      }
+
+      /* Then drain one deferred event per tick. Re-checking `g_cmd_queue`
+       * between each ensures a command arriving mid-burst still jumps
+       * ahead of the remaining CMTIs. */
+      while (cmd_queue_pop(&g_deferred_queue, &cmd)) {
          if (cmd.type == CMD_TYPE_CMTI) {
             handle_cmti(cmd.sms_index);
          } else if (cmd.type == CMD_TYPE_CALL_CONNECTED) {
             modem_call_audio_setup(&g_at_ctx);
-         } else {
-            process_mqtt_command(&cmd);
          }
          last_at_success = time(NULL);
+
+         /* Yield back to MQTT between deferred events. */
+         cmd_entry_t mqtt_cmd;
+         while (cmd_queue_pop(&g_cmd_queue, &mqtt_cmd)) {
+            process_mqtt_command(&mqtt_cmd);
+            last_at_success = time(NULL);
+         }
       }
 
       /* Ring timeout watchdog — if ringing for too long without a termination URC,
@@ -948,6 +883,10 @@ int main(int argc, char *argv[]) {
          }
          last_telemetry = now;
       }
+
+      /* Reassembly sweep — clears timed-out slots even during idle periods
+       * so the 10-min TTL behavior is deterministic regardless of traffic. */
+      sms_reassembly_sweep(now);
 
       /* Heartbeat (every 30s, but skip if recent AT success) */
       if (now - last_heartbeat >= 30) {

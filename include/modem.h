@@ -32,14 +32,17 @@
 /**
  * @brief Run the modem initialization sequence.
  *
- * Sends: AT, ATE0, AT+CMEE=2, AT+CLIP=1, AT+CMGF=1,
- * AT+CNMI=2,1,0,0,0, AT+CREG=1, AT+CSDVC=1, AT+CLVL=3,
- * AT+CECM=1, AT+CSQ, AT+COPS?
+ * Sends: AT, ATE0, AT+CMEE=2, AT+CLIP=1, AT+CMGF=0 (PDU) or 1 (text),
+ * AT+CNMI=2,1,0,0,0, AT+CREG=1, AT+CSDVC=1, AT+CLVL=3, AT+CSQ, AT+COPS?
  *
- * @param at AT context with open serial port.
+ * AT+CSMP (SMS parameters) is only sent in text mode — PDU mode carries the
+ * DCS per-frame so the init-time default is irrelevant.
+ *
+ * @param at       AT context with open serial port.
+ * @param pdu_mode true → AT+CMGF=0 (PDU), false → AT+CMGF=1 (text).
  * @return 0 on success (basic AT works), -1 on failure.
  */
-int modem_init(at_context_t *at);
+int modem_init(at_context_t *at, bool pdu_mode);
 
 /**
  * @brief Poll signal strength (AT+CSQ).

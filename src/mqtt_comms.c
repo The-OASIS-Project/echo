@@ -154,6 +154,7 @@ int mqtt_build_response_json(const char *action,
                              const char *value,
                              const char *err_code,
                              const char *err_msg,
+                             const char *data_json,
                              char *buf,
                              size_t size) {
    if (!action || !request_id || !buf || size == 0) {
@@ -177,6 +178,19 @@ int mqtt_build_response_json(const char *action,
       json_object_object_add(err, "message",
                              json_object_new_string(err_msg ? err_msg : "Unknown error"));
       json_object_object_add(obj, "error", err);
+   }
+
+   /* Optional caller-provided data object. Parse it here so the published
+    * payload is a real nested object instead of a quoted string blob. Bad
+    * input is dropped with a warning — we don't want a caller bug to eat
+    * the whole response. */
+   if (data_json && data_json[0] != '\0') {
+      struct json_object *data = json_tokener_parse(data_json);
+      if (data) {
+         json_object_object_add(obj, "data", data);
+      } else {
+         OLOG_WARNING("mqtt_build_response_json: malformed data_json dropped");
+      }
    }
 
    json_object_object_add(obj, "timestamp", json_object_new_int64(get_timestamp()));
@@ -410,14 +424,15 @@ int mqtt_publish_response(const char *action,
                           bool success,
                           const char *value,
                           const char *err_code,
-                          const char *err_msg) {
+                          const char *err_msg,
+                          const char *data_json) {
    if (!mosq || !mqtt_initialized) {
       return -1;
    }
 
    char buf[1024];
-   if (mqtt_build_response_json(action, request_id, success, value, err_code, err_msg, buf,
-                                sizeof(buf)) < 0) {
+   if (mqtt_build_response_json(action, request_id, success, value, err_code, err_msg, data_json,
+                                buf, sizeof(buf)) < 0) {
       return -1;
    }
 

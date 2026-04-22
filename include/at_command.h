@@ -131,6 +131,28 @@ at_status_t at_command_send_sms(at_context_t *ctx,
                                 at_response_t *response);
 
 /**
+ * @brief Send one PDU-mode SMS segment.
+ *
+ * Two-phase AT+CMGS with the `<octets>` argument, then hex PDU + Ctrl-Z:
+ *   Phase 1: AT+CMGS=<tpdu_octets>\r  →  wait for '>' prompt.
+ *   Phase 2: <pdu_hex>\x1A             →  wait for +CMGS / OK / ERROR.
+ *
+ * The hex string is validated for the hex alphabet before transmission —
+ * an accidental non-hex byte sent in this mode triggers CMS ERROR 305 at
+ * best and unpredictable modem state at worst.
+ *
+ * @param ctx         AT context.
+ * @param tpdu_octets Length argument for AT+CMGS (TPDU only, not SMSC prefix).
+ * @param pdu_hex     Full hex payload, including the "00" SMSC-default prefix.
+ * @param response    Output response.
+ * @return AT_OK or a failure status.
+ */
+at_status_t at_command_send_pdu(at_context_t *ctx,
+                                int tpdu_octets,
+                                const char *pdu_hex,
+                                at_response_t *response);
+
+/**
  * @brief Write raw bytes to the serial port (thread-safe).
  * @return Number of bytes written, or -1 on error.
  */

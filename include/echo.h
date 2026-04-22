@@ -40,12 +40,27 @@
 #define ECHO_DEFAULT_TELEMETRY_S 10
 #define ECHO_DEFAULT_RATE_CALLS_H 5
 #define ECHO_DEFAULT_RATE_SMS_H 20
+/* Per-segment rate bucket for PDU mode. A single concat SMS can burn up to
+ * PDU_MAX_SEGMENTS airtime units, so we budget this separately from the
+ * per-message rate so a chatty user can't exhaust the network quota. */
+#define ECHO_DEFAULT_RATE_SEGMENTS_H 200
+/* Inter-segment pacing. T-Mobile + SIM7600 can wedge on back-to-back
+ * concat sends without a breather. 150ms is gentle on both. */
+#define ECHO_DEFAULT_SEGMENT_DELAY_MS 150
 
 /* AT command limits */
 #define AT_RESPONSE_MAX 4096    /* large enough for UCS2 hex SMS bodies */
 #define AT_TIMEOUT_DEFAULT 2000 /* ms */
 #define AT_TIMEOUT_SMS 60000    /* ms — AT+CMGS waits for network */
 #define AT_TIMEOUT_DIAL 5000    /* ms — ATD returns quickly, result comes as URC */
+/* Inbound SMS storage ops (CMGR read, CMGD delete) hit local modem memory
+ * and normally return <100ms. A short timeout here matters because a
+ * multi-segment SMS fires one CMTI per segment; at the 2s default, a 10-
+ * segment message could block the main-thread command-queue drain for up
+ * to 40s. 500ms caps that at ~10s and still leaves margin over real-world
+ * modem latency. On timeout we fall back to logging + CMGD-fire-forget so
+ * the inbox doesn't fill. */
+#define AT_TIMEOUT_SMS_STORAGE 500
 
 /* SMS limits */
 #define SMS_BODY_MAX 800
@@ -107,26 +122,39 @@ typedef struct {
    int telemetry_interval_s;
    int rate_limit_calls_per_hour;
    int rate_limit_sms_per_hour;
+   int rate_limit_segments_per_hour;
+   int inter_segment_delay_ms;
+   bool pdu_mode; /* true = PDU (AT+CMGF=0), false = legacy text mode */
    bool service_mode;
 } echo_config_t;
 
-/* Rate limiter bucket */
+/* Leaky-bucket rate limiter. Fills at `max_per_hour / 3600` tokens/sec up to
+ * a `max_per_hour` ceiling; a `take_n()` spends N tokens atomically.
+ *
+ * Replaces an earlier ring-buffer design that silently capped active count
+ * at 64 — the old limiter never rejected anything when `max_per_hour > 64`.
+ * The counter form is correct at any configured limit and O(1) per call. */
 typedef struct {
-   int64_t timestamps[64]; /* ring buffer of event timestamps (epoch seconds) */
-   int head;               /* next write position */
-   int count;              /* events in current window */
-   int max_per_hour;       /* configured limit */
+   double tokens;           /* current token balance (fractional) */
+   int64_t last_refill_sec; /* wall clock seconds of last refill */
+   int max_per_hour;        /* bucket ceiling + refill rate input */
 } rate_bucket_t;
 
 /**
- * @brief Initialize a rate limiter bucket.
+ * @brief Initialize a rate limiter bucket, pre-filled to capacity.
  */
 void rate_bucket_init(rate_bucket_t *bucket, int max_per_hour);
 
 /**
- * @brief Check if an action is allowed and record it if so.
+ * @brief Try to consume one token; record it if available.
  * @return true if allowed, false if rate limited.
  */
 bool rate_bucket_allow(rate_bucket_t *bucket);
+
+/**
+ * @brief Try to consume `n` tokens atomically (no partial debit on failure).
+ * @return true if all N allowed, false if insufficient balance.
+ */
+bool rate_bucket_take_n(rate_bucket_t *bucket, int n);
 
 #endif /* ECHO_H */
