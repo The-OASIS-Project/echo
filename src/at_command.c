@@ -36,6 +36,7 @@
 #include <unistd.h>
 
 #include "logging.h"
+#include "pdu.h"
 
 /* ── Helpers ─────────────────────────────────────────────────────────── */
 
@@ -422,6 +423,151 @@ at_status_t at_command_send_sms(at_context_t *ctx,
          ctx->pending.type = AT_PENDING_NONE;
          pthread_mutex_unlock(&ctx->pending.mutex);
          OLOG_ERROR("SMS send timeout after body");
+         if (response) {
+            response->status = AT_TIMEOUT;
+         }
+         return AT_TIMEOUT;
+      }
+   }
+
+   at_status_t status = ctx->pending.response.status;
+   if (response) {
+      *response = ctx->pending.response;
+   }
+   ctx->pending.type = AT_PENDING_NONE;
+   pthread_mutex_unlock(&ctx->pending.mutex);
+
+   return status;
+}
+
+/* ── PDU send (two-phase with <octets> arg) ──────────────────────────── */
+
+static bool hex_alphabet_valid(const char *hex) {
+   if (!hex)
+      return false;
+   size_t len = 0;
+   for (const char *p = hex; *p; p++) {
+      char c = *p;
+      bool ok = (c >= '0' && c <= '9') || (c >= 'A' && c <= 'F') || (c >= 'a' && c <= 'f');
+      if (!ok) {
+         return false;
+      }
+      len++;
+   }
+   return (len > 0) && ((len & 1) == 0);
+}
+
+at_status_t at_command_send_pdu(at_context_t *ctx,
+                                int tpdu_octets,
+                                const char *pdu_hex,
+                                at_response_t *response) {
+   if (!ctx || ctx->fd < 0 || !pdu_hex || tpdu_octets <= 0) {
+      return AT_PORT_ERROR;
+   }
+   /* Re-validate before we push bytes to the modem. A bad encode that slips
+    * through here would otherwise corrupt modem state, not just error. */
+   if (!hex_alphabet_valid(pdu_hex)) {
+      OLOG_ERROR("at_command_send_pdu: PDU hex failed alphabet validation");
+      if (response) {
+         memset(response, 0, sizeof(*response));
+         response->status = AT_ERROR;
+      }
+      return AT_ERROR;
+   }
+
+   char cmgs[32];
+   snprintf(cmgs, sizeof(cmgs), "AT+CMGS=%d", tpdu_octets);
+
+   pthread_mutex_lock(&ctx->pending.mutex);
+   ctx->pending.type = AT_PENDING_SMS;
+   ctx->pending.completed = false;
+   memset(&ctx->pending.response, 0, sizeof(ctx->pending.response));
+   pthread_mutex_unlock(&ctx->pending.mutex);
+
+   if (at_write_cmd(ctx, cmgs) < 0) {
+      pthread_mutex_lock(&ctx->pending.mutex);
+      ctx->pending.type = AT_PENDING_NONE;
+      pthread_mutex_unlock(&ctx->pending.mutex);
+      return AT_PORT_ERROR;
+   }
+
+   /* Wait for '>' prompt. */
+   struct timespec ts;
+   clock_gettime(CLOCK_REALTIME, &ts);
+   ts.tv_sec += AT_TIMEOUT_SMS / 1000;
+   ts.tv_nsec += (AT_TIMEOUT_SMS % 1000) * 1000000L;
+   if (ts.tv_nsec >= 1000000000L) {
+      ts.tv_sec++;
+      ts.tv_nsec -= 1000000000L;
+   }
+
+   pthread_mutex_lock(&ctx->pending.mutex);
+   while (!ctx->pending.completed) {
+      int rc = pthread_cond_timedwait(&ctx->pending.cond, &ctx->pending.mutex, &ts);
+      if (rc == ETIMEDOUT) {
+         char esc = 0x1B;
+         if (at_write_raw(ctx, &esc, 1) < 0) {
+            OLOG_WARNING("PDU abort ESC write failed after prompt timeout");
+         }
+         ctx->pending.type = AT_PENDING_NONE;
+         pthread_mutex_unlock(&ctx->pending.mutex);
+         OLOG_ERROR("PDU prompt timeout for AT+CMGS=%d", tpdu_octets);
+         if (response) {
+            response->status = AT_TIMEOUT;
+         }
+         return AT_TIMEOUT;
+      }
+   }
+
+   if (ctx->pending.response.status != AT_OK) {
+      at_status_t status = ctx->pending.response.status;
+      if (response) {
+         *response = ctx->pending.response;
+      }
+      ctx->pending.type = AT_PENDING_NONE;
+      pthread_mutex_unlock(&ctx->pending.mutex);
+      return status;
+   }
+   pthread_mutex_unlock(&ctx->pending.mutex);
+
+   /* Phase 2: hex body + Ctrl-Z. Fixed stack buffer — `pdu_hex` has a
+    * compile-time ceiling of PDU_MAX_HEX_LEN, so no allocation needed. */
+   size_t hex_len = strlen(pdu_hex);
+   if (hex_len > PDU_MAX_HEX_LEN) {
+      return AT_PORT_ERROR;
+   }
+   char send_buf[PDU_MAX_HEX_LEN + 2];
+   memcpy(send_buf, pdu_hex, hex_len);
+   send_buf[hex_len] = 0x1A;
+
+   pthread_mutex_lock(&ctx->pending.mutex);
+   ctx->pending.type = AT_PENDING_SYNC;
+   ctx->pending.completed = false;
+   memset(&ctx->pending.response, 0, sizeof(ctx->pending.response));
+   pthread_mutex_unlock(&ctx->pending.mutex);
+
+   if (at_write_raw(ctx, send_buf, (int)(hex_len + 1)) < 0) {
+      pthread_mutex_lock(&ctx->pending.mutex);
+      ctx->pending.type = AT_PENDING_NONE;
+      pthread_mutex_unlock(&ctx->pending.mutex);
+      return AT_PORT_ERROR;
+   }
+
+   clock_gettime(CLOCK_REALTIME, &ts);
+   ts.tv_sec += AT_TIMEOUT_SMS / 1000;
+   ts.tv_nsec += (AT_TIMEOUT_SMS % 1000) * 1000000L;
+   if (ts.tv_nsec >= 1000000000L) {
+      ts.tv_sec++;
+      ts.tv_nsec -= 1000000000L;
+   }
+
+   pthread_mutex_lock(&ctx->pending.mutex);
+   while (!ctx->pending.completed) {
+      int rc = pthread_cond_timedwait(&ctx->pending.cond, &ctx->pending.mutex, &ts);
+      if (rc == ETIMEDOUT) {
+         ctx->pending.type = AT_PENDING_NONE;
+         pthread_mutex_unlock(&ctx->pending.mutex);
+         OLOG_ERROR("PDU send timeout after body (octets=%d)", tpdu_octets);
          if (response) {
             response->status = AT_TIMEOUT;
          }

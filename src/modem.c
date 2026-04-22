@@ -46,12 +46,12 @@ static int init_cmd(at_context_t *at, const char *cmd, const char *desc) {
    return 0;
 }
 
-int modem_init(at_context_t *at) {
+int modem_init(at_context_t *at, bool pdu_mode) {
    if (!at) {
       return -1;
    }
 
-   OLOG_INFO("Starting modem initialization sequence");
+   OLOG_INFO("Starting modem initialization sequence (mode=%s)", pdu_mode ? "PDU" : "text");
 
    /* Verify communication */
    if (init_cmd(at, "AT", "verify comm") != 0) {
@@ -62,11 +62,14 @@ int modem_init(at_context_t *at) {
    /* Core setup — failures are warnings, not fatal */
    init_cmd(at, "ATE0", "disable echo");
    init_cmd(at, "AT+CMEE=2", "verbose errors");
-   /* Keep modem default UCS2 charset for full Unicode/emoji SMS support.
-    * AT+CSMP DCS=8 tells the network the body is UCS2-encoded. */
-   init_cmd(at, "AT+CSMP=17,167,0,8", "SMS params UCS2 DCS");
    init_cmd(at, "AT+CLIP=1", "caller ID");
-   init_cmd(at, "AT+CMGF=1", "SMS text mode");
+   if (pdu_mode) {
+      init_cmd(at, "AT+CMGF=0", "SMS PDU mode");
+   } else {
+      /* Text-mode path keeps the DCS hint so UCS2 text-mode encodes still work. */
+      init_cmd(at, "AT+CSMP=17,167,0,8", "SMS params UCS2 DCS");
+      init_cmd(at, "AT+CMGF=1", "SMS text mode");
+   }
    init_cmd(at, "AT+CPMS=\"ME\",\"ME\",\"ME\"", "SMS storage to ME");
    init_cmd(at, "AT+CNMI=2,1,0,0,0", "SMS notification URC");
    init_cmd(at, "AT+CREG=1", "network reg URC");

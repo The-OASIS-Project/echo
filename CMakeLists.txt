@@ -34,7 +34,10 @@ set(SOURCES
    src/modem.c
    src/mqtt_comms.c
    src/oasis-echo.c
+   src/pdu.c
    src/sms.c
+   src/sms_io.c
+   src/sms_reassembly.c
    src/urc_handler.c
 )
 
@@ -93,4 +96,16 @@ if(BUILD_TESTS)
                          ${MOSQUITTO_LIBRARIES})
    target_include_directories(test_mqtt_messages PRIVATE include ${JSONC_INCLUDE_DIRS})
    add_test(NAME test_mqtt_messages COMMAND test_mqtt_messages)
+
+   # test_pdu — PDU encode/decode + malformed-input rejection
+   add_executable(test_pdu tests/test_pdu.c src/pdu.c)
+   target_link_libraries(test_pdu unity echo_logging pthread)
+   target_include_directories(test_pdu PRIVATE include)
+   add_test(NAME test_pdu COMMAND test_pdu)
+
+   # test_sms_reassembly — LRU, per-sender cap, duplicate handling
+   add_executable(test_sms_reassembly tests/test_sms_reassembly.c src/sms_reassembly.c)
+   target_link_libraries(test_sms_reassembly unity echo_logging)
+   target_include_directories(test_sms_reassembly PRIVATE include)
+   add_test(NAME test_sms_reassembly COMMAND test_sms_reassembly)
 endif()

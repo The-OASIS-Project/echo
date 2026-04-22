@@ -1,71 +1,67 @@
 # CLAUDE.md
 
+Guidance for Claude Code when working in this repository.
+
 ## Project Overview
 
-ECHO (Enhanced Cellular Handling Operations) is the OASIS modem daemon for the SIM7600G-H 4G modem. It owns the serial port, handles all AT command traffic, publishes telemetry and events via MQTT, and receives commands from DAWN.
+ECHO (Enhanced Cellular Handling Operations) is the OASIS modem daemon for the SIM7600G-H 4G modem. It owns the serial port, handles all AT command traffic, publishes telemetry and events via MQTT, and receives commands from DAWN. Template: STAT (system telemetry daemon).
 
-Part of The OASIS Project. Template: STAT (system telemetry daemon).
+See @ARCHITECTURE.md for subsystem details and @README.md for deployment context.
 
-## Building
+## Critical Rules — Always Follow
+
+- **NEVER delete files.** Tell the developer which files to delete.
+- **NEVER run `git add`, `git commit`, or `git push`.** Suggest the command and message; let the developer run it.
+- **Feedback before implementation.** Provide analysis, trade-offs, and a recommendation *first*. Wait for explicit confirmation ("go ahead", "do it", "yes") before coding.
+- **Format before committing.** Every change must pass `./format_code.sh --check`. Pre-commit hook enforces this.
+- **GPL header on every new `.c`/`.h`.** Template in @CODING_STYLE_GUIDE.md.
+- **Design doc commit policy**: commit design docs only when they describe shipped or in-flight code. Docs for planned-but-unstarted work stay untracked.
+
+## Build & Test
 
 ```bash
-# Configure and build
+# Build
 cmake -B build -DCMAKE_BUILD_TYPE=Debug
 make -C build -j8
 
-# Run tests
+# Run tests (Unity framework, runs without hardware)
 ctest --test-dir build --output-on-failure
 
-# Run individual test
-./build/tests/test_sms
+# Format
+./format_code.sh                 # fix
+./format_code.sh --check         # CI mode
+./format_code.sh --changed       # only changed files
 ```
 
-### Dependencies
-- `libmosquitto` — MQTT client library
-- `json-c` — JSON construction and parsing
-- `pthread` — threading (system)
-- Unity (vendored in `tests/unity/`) — unit test framework
+- Dependencies: `libmosquitto`, `json-c`, `pthread`, Unity (vendored).
+- Requires `clang-format-14` for format checks.
+- Pre-commit hook: `./install-git-hooks.sh` (one-time).
 
-## Code Formatting
+## Code Standards
 
-**MANDATORY**: All code MUST be formatted before committing.
+Full standards in @CODING_STYLE_GUIDE.md. Critical gotchas specific to ECHO:
 
-```bash
-# Format all code (run from repository root)
-./format_code.sh
+- **Return codes**: `SUCCESS` (0) / `FAILURE` (1) — never negative. Specific error codes > 1.
+- **Logging**: use `OLOG_INFO` / `OLOG_WARNING` / `OLOG_ERROR` (ECHO's convention).
+- **Naming**: `snake_case` functions/vars, `UPPER_CASE` constants, `_t` suffix on types.
+- **Memory**: prefer static allocation; null-check after malloc; `free(ptr); ptr = NULL;`.
+- **Functions**: soft target < 50 lines, inputs first / outputs last.
 
-# Check formatting without modifying files
-./format_code.sh --check
+## Threading (hard constraints)
 
-# Format only changed files (fast)
-./format_code.sh --changed
-```
+Three threads — know which one you're in:
 
-Requires `clang-format-14`. Install: `sudo apt-get install clang-format-14`
+- **Main thread**: command-queue drain, telemetry polling (10s), heartbeat (30s).
+- **URC reader thread**: blocking serial reads, line parsing, URC classification, AT response delivery via condvar.
+- **Mosquitto thread**: network I/O, message callbacks (queues commands to main thread).
 
-### Git Hooks
-Install the pre-commit hook to automatically check formatting:
-```bash
-./install-git-hooks.sh
-```
+**Never call `at_command_send()` from the URC reader thread.** Use the command queue. Doing so deadlocks the condvar.
 
-## Architecture
+- Single serial reader: URC reader owns **all** reads. Main thread only writes AT commands.
+- CMTI handling: SMS reads queued from URC → main thread to avoid deadlock.
+- Call state: `__atomic` builtins on `g_call_state` (3 threads touch it).
 
-### Threading Model
-
-Three threads:
-- **Main thread**: Command queue drain, telemetry polling (10s), heartbeat (30s)
-- **URC reader thread**: Blocking serial reads, line parsing, URC classification, AT response delivery via condvar
-- **Mosquitto thread**: Network I/O, message callbacks (queues commands to main thread)
-
-### Key Design Decisions
-
-- **Single serial reader**: URC reader owns ALL reads. Main thread only writes AT commands.
-- **Command queue**: MQTT commands queued to lock-free SPSC ring buffer, drained by main thread. Prevents blocking mosquitto's event loop.
-- **Deferred CMTI**: SMS reads queued from URC thread to main thread to avoid condvar deadlock.
-- **Atomic call state**: `__atomic` builtins for `g_call_state` (3 threads access it).
-
-### AT Command Types
+## AT Command Types
 
 | Type | Function | Behavior |
 |------|----------|----------|
@@ -73,110 +69,44 @@ Three threads:
 | Async | `at_command_send_async()` | Write and return; result comes as URC |
 | SMS | `at_command_send_sms()` | Two-phase: wait for `>` prompt, then body+Ctrl-Z |
 
-### MQTT Topics
+## MQTT Topics
 
 | Topic | Dir | Content |
 |-------|-----|---------|
 | `echo/telemetry` | out | Signal, network, call state (every 10s) |
 | `echo/events` | out | Incoming call, SMS, call ended |
-| `echo/response` | out | Command responses with request_id |
+| `echo/response` | out | Command responses with `request_id` |
 | `echo/status` | out | Online/offline (LWT) |
 | `echo/cmd` | in | Commands from DAWN |
 
-All messages conform to OCP v1.3.
-
-## Coding Standards
-
-Follow `CODING_STYLE_GUIDE.md` strictly:
-
-**Naming**: `snake_case` functions/variables, `UPPER_CASE` constants, `_t` suffix on types.
-
-**Error Handling**: Return 0 on success. Always check return values. Log with `OLOG_ERROR()`.
-
-**Memory**: Prefer static allocation. Minimize malloc. Free and NULL.
-
-**File Headers**: GPL license block required on all `.c` and `.h` files (see CODING_STYLE_GUIDE.md).
-
-**Functions**: Soft target < 50 lines. Inputs first, outputs last.
-
-**Threading**: Never call `at_command_send()` from the URC reader thread. Use the command queue.
-
-## Important Files
-
-**Source modules:**
-- `src/oasis-echo.c` — Main entry, command queue, URC event dispatch, MQTT command processor
-- `src/at_command.c` — Serial I/O with flock, sync/async/SMS AT commands, terminator parsing
-- `src/urc_handler.c` — URC reader thread, classification, RING+CLIP merge
-- `src/modem.c` — Init sequence, signal polling, telemetry builder, echo cancellation
-- `src/mqtt_comms.c` — MQTT lifecycle, json-c JSON builders, command parser
-- `src/sms.c` — Phone number validation, SMS body sanitization, CLIP sanitization
-- `src/logging.c` — Logging (copied from STAT)
-
-**Headers:**
-- `include/echo.h` — Global types, config struct, call/reg/SIM enums, rate bucket
-- `include/at_command.h` — AT context, response, pending state types
-- `include/urc_handler.h` — URC event types, callback, context
-- `include/modem.h` — Modem init, polling, telemetry builder
-- `include/mqtt_comms.h` — MQTT topics, publish/subscribe/parse API
-- `include/sms.h` — Validation and sanitization API
-
-**Configuration:**
-- `config/echo.conf` — MQTT credentials, serial port, rate limits (systemd EnvironmentFile)
-- `config/oasis-echo.service` — systemd service unit
-- `config/sim7600-rndis.service` — RNDIS data path boot service
-- `scripts/sim7600-rndis-up.sh` — RNDIS activation script
-
-**Tooling:**
-- `.clang-format` — clang-format-14 config (matches DAWN)
-- `format_code.sh` — Format all code (adapted from DAWN)
-- `pre-commit.hook` — Git pre-commit formatting check
-- `install-git-hooks.sh` — Hook installer
-- `.github/workflows/ci.yml` — CI: format-check + build + tests
-
-## Testing
-
-Unity framework (vendored in `tests/unity/`, MIT license). Four test modules:
-
-| Test | Assertions | What it covers |
-|------|-----------|---------------|
-| `test_at_command` | 14 | Response terminator parsing, status strings |
-| `test_sms` | 24 | Phone number validation, body sanitization, CLIP sanitization |
-| `test_urc_handler` | 22 | URC classification, RING+CLIP merge, VOICE CALL URCs |
-| `test_mqtt_messages` | 16 | Telemetry/event/response JSON, command parsing |
-
-Tests link against specific source files (not the full daemon binary), so they run without hardware or an MQTT broker.
-
-```bash
-# Build and run all tests
-cmake -B build -DCMAKE_BUILD_TYPE=Debug && make -C build -j8
-ctest --test-dir build --output-on-failure
-```
+All messages conform to OCP v1.4 (`ocp_get_timestamp_ms()` for ms timestamps, `msg_type` field on every message).
 
 ## SIM7600 Hardware Notes
 
 Discoveries from live hardware testing:
 
-- Modem kept in default UCS2 charset — `AT+CSMP=17,167,0,8` sets DCS=8 to tell the network body is UCS2-encoded. Enables full Unicode/emoji SMS.
-- Phone numbers and SMS bodies are UCS2 hex-encoded for `AT+CMGS` and decoded from `AT+CMGR` responses. CLIP and ATD use plain ASCII.
-- `AT+CPMS="ME","ME","ME"` required — default SMS read storage is "SR" (status reports)
-- `AT+CHUP` for hangup instead of `ATH` — works reliably in all call states
-- `AT+CECM=1` only works during active calls — sent per-call, not at init
-- `VOICE CALL: BEGIN` / `VOICE CALL: END` are SIM7600-specific URCs (not standard `CONNECT`)
-- Modem sends `VOICE CALL: END` + `NO CARRIER` back-to-back — duplicate suppressed in event handler
+- Modem kept in default UCS2 charset — `AT+CSMP=17,167,0,8` sets DCS=8. Enables full Unicode/emoji SMS.
+- Phone numbers and SMS bodies are UCS2 hex-encoded for `AT+CMGS` and decoded from `AT+CMGR`. CLIP and ATD use plain ASCII.
+- `AT+CPMS="ME","ME","ME"` required — default SMS read storage is "SR" (status reports).
+- `AT+CHUP` for hangup, not `ATH` — works reliably in all call states.
+- `AT+CECM=1` only works during active calls — sent per-call, not at init.
+- `VOICE CALL: BEGIN` / `VOICE CALL: END` are SIM7600-specific URCs (not standard `CONNECT`).
+- Modem sends `VOICE CALL: END` + `NO CARRIER` back-to-back — duplicate suppressed in event handler.
+- Current firmware (`LE20B04SIM7600G22`) does **not** include MMS AT commands. See `~/code/The-OASIS-Project/dawn/docs/UNIFIED_IMAGE_STORE_DESIGN.md` §Phase 4 for unblock paths.
 
 ## Development Lifecycle
 
-1. **Implement**: Build and format check after each chunk: `make -C build -j8` + `./format_code.sh --check`
-2. **Test**: Run `ctest --test-dir build --output-on-failure`
-3. **Review**: Run review agents on the diff (architecture-reviewer, embedded-efficiency-reviewer, security-auditor)
-4. **Manual test**: Verify on live hardware if touching AT commands, URC handling, or MQTT
-5. **Format**: `./format_code.sh`
-6. **Commit**: Provide `git add` + commit message to developer (never run git commands directly)
+1. **Implement** — build + format check after each chunk: `make -C build -j8` + `./format_code.sh --check`.
+2. **Test** — `ctest --test-dir build --output-on-failure`.
+3. **Review** — run review agents on the diff (architecture-reviewer, embedded-efficiency-reviewer, security-auditor).
+4. **Manual test** — verify on live hardware if touching AT commands, URC handling, or MQTT.
+5. **Format** — `./format_code.sh` one final time.
+6. **Commit** — provide `git add` + commit message; **developer runs git commands**.
 
-## Design Document
+## Design Documents
 
-Single source of truth: `~/code/The-OASIS-Project/dawn/docs/PHONE_SMS_DESIGN.md`
+Phone/SMS integration design: `~/code/The-OASIS-Project/dawn/docs/PHONE_SMS_DESIGN.md`.
 
 ## License
 
-GPLv3 or later. All source files include GPL header block.
+GPLv3 or later. Every new source file includes the GPL header block.

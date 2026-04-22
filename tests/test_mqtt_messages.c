@@ -138,7 +138,7 @@ void test_event_json_null_type(void) {
 
 void test_response_json_success(void) {
    char buf[512];
-   int len = mqtt_build_response_json("dial", "worker_0_42", true, NULL, NULL, NULL, buf,
+   int len = mqtt_build_response_json("dial", "worker_0_42", true, NULL, NULL, NULL, NULL, buf,
                                       sizeof(buf));
    TEST_ASSERT_GREATER_THAN(0, len);
 
@@ -153,7 +153,7 @@ void test_response_json_success(void) {
 void test_response_json_success_with_value(void) {
    char buf[512];
    int len = mqtt_build_response_json("signal", "worker_0_48", true, "{\\\"signal_dbm\\\":-67}",
-                                      NULL, NULL, buf, sizeof(buf));
+                                      NULL, NULL, NULL, buf, sizeof(buf));
    TEST_ASSERT_GREATER_THAN(0, len);
 
    struct json_object *root = parse_and_check(buf);
@@ -165,7 +165,7 @@ void test_response_json_success_with_value(void) {
 void test_response_json_error(void) {
    char buf[512];
    int len = mqtt_build_response_json("dial", "worker_0_42", false, NULL, "NO_CARRIER",
-                                      "Call failed: no carrier", buf, sizeof(buf));
+                                      "Call failed: no carrier", NULL, buf, sizeof(buf));
    TEST_ASSERT_GREATER_THAN(0, len);
 
    struct json_object *root = parse_and_check(buf);

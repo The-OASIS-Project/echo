@@ -83,13 +83,17 @@ int mqtt_publish_event(const char *event_json);
  * @param value      Optional value string (for success responses).
  * @param err_code   Error code string (for error responses, e.g. "NO_CARRIER").
  * @param err_msg    Error message string (for error responses).
+ * @param data_json  Optional pre-serialized JSON object (e.g., "{\"segments_sent\":3}")
+ *                   merged into the response under the "data" key. NULL is fine.
+ *                   Caller owns the string.
  */
 int mqtt_publish_response(const char *action,
                           const char *request_id,
                           bool success,
                           const char *value,
                           const char *err_code,
-                          const char *err_msg);
+                          const char *err_msg,
+                          const char *data_json);
 
 /**
  * @brief Publish online status (echo/status, QoS 1, retained).
@@ -140,6 +144,7 @@ int mqtt_build_response_json(const char *action,
                              const char *value,
                              const char *err_code,
                              const char *err_msg,
+                             const char *data_json,
                              char *buf,
                              size_t size);
 
