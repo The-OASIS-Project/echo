@@ -26,6 +26,7 @@
 #include "urc_handler.h"
 
 #include <errno.h>
+#include <inttypes.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -229,6 +230,8 @@ static void *urc_reader_thread(void *arg) {
    urc_context_t *ctx = (urc_context_t *)arg;
    at_context_t *at = ctx->at_ctx;
    char line[AT_RESPONSE_MAX];
+   int consecutive_empty = 0;
+   int64_t empty_run_start_ms = 0;
 
    OLOG_INFO("URC reader thread started");
 
@@ -245,8 +248,30 @@ static void *urc_reader_thread(void *arg) {
          break;
       }
       if (len == 0) {
-         continue; /* timeout, loop back */
+         if (consecutive_empty == 0) {
+            empty_run_start_ms = urc_now_ms();
+         }
+         consecutive_empty++;
+         /* With VTIME=1 (100ms), N legitimate timeouts take ~N*100ms.
+          * If we see URC_MAX_CONSECUTIVE_EMPTY empties in far less time
+          * than expected, read() is returning EOF instantly — the device
+          * is gone.  The time threshold allows ~10ms per read (vs 100ms
+          * for a real VTIME timeout) to absorb scheduling jitter. */
+         if (consecutive_empty >= URC_MAX_CONSECUTIVE_EMPTY) {
+            int64_t elapsed_ms = urc_now_ms() - empty_run_start_ms;
+            int64_t expected_ms = (int64_t)consecutive_empty * URC_VTIME_EXPECT_MS;
+            if (elapsed_ms < expected_ms) {
+               OLOG_ERROR("Serial device disconnected (%d empty reads in %" PRId64
+                          "ms, expected ~%" PRId64 "ms)",
+                          consecutive_empty, elapsed_ms, expected_ms);
+               break;
+            }
+            consecutive_empty = 0;
+         }
+         continue;
       }
+
+      consecutive_empty = 0;
 
       /* Skip empty lines */
       if (line[0] == '\0') {
@@ -353,6 +378,9 @@ static void *urc_reader_thread(void *arg) {
       }
    }
 
+   if (ctx->shutdown_flag) {
+      *ctx->shutdown_flag = 0;
+   }
    OLOG_INFO("URC reader thread exiting");
    return NULL;
 }

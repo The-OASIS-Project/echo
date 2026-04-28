@@ -25,6 +25,7 @@
 #ifndef URC_HANDLER_H
 #define URC_HANDLER_H
 
+#include <signal.h>
 #include <stdbool.h>
 
 #include "at_command.h"
@@ -71,6 +72,9 @@ typedef struct {
    urc_event_callback_t callback; /* event callback */
    void *userdata;                /* opaque userdata for callback */
 
+   /* Optional: set to 0 on fatal serial error to trigger daemon shutdown */
+   volatile sig_atomic_t *shutdown_flag;
+
    /* RING+CLIP merge state */
    bool ring_pending;         /* RING received, waiting for CLIP */
    int64_t ring_timestamp_ms; /* when RING was received */
@@ -79,6 +83,13 @@ typedef struct {
 
 /* RING+CLIP merge timeout (ms) */
 #define URC_CLIP_TIMEOUT_MS 300
+
+/* Detect serial device disconnection via timing.  With VTIME=1 each
+ * legitimate empty read blocks for ~100ms.  If MAX_CONSECUTIVE_EMPTY
+ * reads complete in far less than VTIME_EXPECT_MS * count, read() is
+ * returning EOF instantly and the device is gone. */
+#define URC_MAX_CONSECUTIVE_EMPTY 50
+#define URC_VTIME_EXPECT_MS 10 /* minimum acceptable ms per empty read */
 
 /**
  * @brief Start the URC reader thread.

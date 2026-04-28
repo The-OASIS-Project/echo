@@ -44,6 +44,7 @@
 /* ── Globals ─────────────────────────────────────────────────────────── */
 
 static volatile sig_atomic_t g_running = 1;
+static volatile sig_atomic_t g_signal_shutdown = 0;
 static at_context_t g_at_ctx;
 static rate_bucket_t g_call_bucket;
 static rate_bucket_t g_sms_bucket;
@@ -136,6 +137,7 @@ static bool cmd_queue_pop(cmd_queue_t *q, cmd_entry_t *entry) {
 
 static void signal_handler(int sig) {
    (void)sig;
+   g_signal_shutdown = 1;
    g_running = 0;
 }
 
@@ -782,6 +784,7 @@ int main(int argc, char *argv[]) {
       close_logging();
       return 1;
    }
+   urc_ctx.shutdown_flag = &g_running;
 
    /* Run modem init sequence */
    if (modem_init(&g_at_ctx, config.pdu_mode) != 0) {
@@ -923,7 +926,12 @@ int main(int argc, char *argv[]) {
    mqtt_comms_cleanup();
    urc_stop(&urc_ctx);
    at_close(&g_at_ctx);
+
+   if (!g_signal_shutdown) {
+      OLOG_ERROR("Exiting due to serial device failure (exit code 1)");
+   }
+
    close_logging();
 
-   return 0;
+   return g_signal_shutdown ? 0 : 1;
 }
