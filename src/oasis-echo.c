@@ -407,8 +407,11 @@ static void process_mqtt_command(const cmd_entry_t *cmd) {
          return;
       }
 
+      /* value is validated <= PHONE_NUMBER_MAX by sms_validate_number above; the
+       * bounded precision lets -Wformat-truncation prove no truncation and
+       * hard-caps the dial string regardless of the source buffer size. */
       char at_cmd[64];
-      snprintf(at_cmd, sizeof(at_cmd), "ATD%s;", value);
+      snprintf(at_cmd, sizeof(at_cmd), "ATD%.*s;", PHONE_NUMBER_MAX, value);
       at_status_t rc = at_command_send_async(&g_at_ctx, at_cmd);
       if (rc == AT_OK) {
          set_call_state(CALL_STATE_DIALING);
