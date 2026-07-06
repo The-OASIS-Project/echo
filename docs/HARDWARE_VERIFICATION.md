@@ -115,3 +115,26 @@ Replaced `AT+CSCS="GSM"` approach with native UCS2 encoding for full Unicode/emo
 | Receive SMS sender decode | Pass | UCS2 hex sender decoded to "+16786432695" |
 | MMS (image) receive | Blank | Empty sender/body — MMS requires separate MMSC fetch (Phase 6) |
 | UCS2 encode/decode roundtrip | Pass | Unit tested: ASCII, phone numbers, emoji, surrogate pairs (10 assertions) |
+
+## USB PCM Call Audio (2026-07-06)
+
+Verified full-duplex **USB PCM call audio over `/dev/ttyUSB4`** on a live call (firmware `LE20B04SIM7600G22`). This **supersedes the earlier "3.5 mm analog jack only, no USB PCM" conclusion**, which was a false negative: `AT+CPCMREG=1` was tested at idle and returned `ERROR`. Like `AT+CECM=1` (see Modem Init table), **`CPCMREG`/`CPCMFRM` are per-call commands** — they only succeed inside an active call.
+
+**Capability (queried at idle):** `AT+CPCMREG=?` → `(0-1)`, `AT+CPCMFRM=?` → `(0-1)`, `AT+CSDVC=?` → `(0,1,3)`, `AT+CLVL=?` → `(0-5)`. The modem does **not** enumerate a USB Audio Class / ALSA card — PCM is a raw byte stream on ttyUSB4 (USB interface IF06), not an ALSA device.
+
+**Per-call enable sequence** (on the AT port, after `VOICE CALL: BEGIN`):
+
+| Command | Result | Notes |
+|---------|--------|-------|
+| `AT+CPCMFRM=1` | OK | 16 kHz wideband (`0`=8 kHz). **Resets to 8 kHz on modem reset** — send per call. Applies to both directions. |
+| `AT+CPCMREG=1` | OK | Start PCM transfer on ttyUSB4. Returns `ERROR` at idle. |
+| `AT+CPCMREG=0` (at teardown) | ERROR | Harmless — PCM auto-stops on `AT+CHUP`; prefer just `CHUP`. |
+
+**Format:** 16 kHz, 16-bit signed little-endian, mono, raw (no framing/header).
+
+| Direction | Result | Details |
+|-----------|--------|---------|
+| Downlink (far-end → ttyUSB4) | Pass | Byte rate exactly 32 kB/s (16 kHz S16LE); captured speech transcribed cleanly by local Whisper. |
+| Uplink (ttyUSB4 → far-end) | Pass | Voice clip played back at natural pitch/speed (confirmed by the party on the call). |
+| Uplink real-time pacing | Required | A faster-than-realtime write overruns the modem PCM sink and glitches. Feed ~20 ms frames on a monotonic clock with a small primed lead. |
+| Pure sine test tone | Caveat | Not a valid uplink test — the AMR voice codec distorts sustained tones (sounds like a mid-tone pitch split). Validate with speech, not tones. |

@@ -259,13 +259,29 @@ sim_status_t modem_query_sim_status(at_context_t *at) {
 
 /* ── Call audio setup ─────────────────────────────────────────────────── */
 
-void modem_call_audio_setup(at_context_t *at) {
+bool modem_call_audio_setup(at_context_t *at) {
    at_response_t resp;
    if (at_command_send(at, "AT+CECM=1", &resp, AT_TIMEOUT_DEFAULT) == AT_OK) {
       OLOG_INFO("Echo cancellation enabled");
    } else {
       OLOG_WARNING("Echo cancellation failed (AT+CECM=1)");
    }
+
+   /* Wideband 16 kHz USB PCM.  Resets to 8 kHz on modem reset, so set per call.
+    * Non-fatal on failure — PCM still works at 8 kHz, but DAWN's bridge expects
+    * 16 kHz, so log loudly. */
+   if (at_command_send(at, "AT+CPCMFRM=1", &resp, AT_TIMEOUT_DEFAULT) != AT_OK) {
+      OLOG_WARNING("USB PCM 16 kHz set failed (AT+CPCMFRM=1)");
+   }
+
+   /* Start USB PCM transfer on ttyUSB4.  This is what makes call audio flow to
+    * DAWN; gate pcm_ready on its success. */
+   if (at_command_send(at, "AT+CPCMREG=1", &resp, AT_TIMEOUT_DEFAULT) == AT_OK) {
+      OLOG_INFO("USB PCM started (ttyUSB4, 16 kHz S16LE)");
+      return true;
+   }
+   OLOG_WARNING("USB PCM start failed (AT+CPCMREG=1) — no call audio to DAWN");
+   return false;
 }
 
 /* ── Heartbeat ───────────────────────────────────────────────────────── */

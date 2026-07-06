@@ -834,7 +834,15 @@ int main(int argc, char *argv[]) {
          if (cmd.type == CMD_TYPE_CMTI) {
             handle_cmti(cmd.sms_index);
          } else if (cmd.type == CMD_TYPE_CALL_CONNECTED) {
-            modem_call_audio_setup(&g_at_ctx);
+            /* Arm echo cancel + USB PCM (per-call AT commands).  Only announce
+             * pcm_ready once CPCMREG=1 succeeded, so DAWN opens ttyUSB4 exactly
+             * when audio is flowing — no startup race. */
+            if (modem_call_audio_setup(&g_at_ctx)) {
+               char json[256];
+               if (mqtt_build_event_json("pcm_ready", NULL, json, sizeof(json)) >= 0) {
+                  mqtt_publish_event(json);
+               }
+            }
          }
          last_at_success = time(NULL);
 

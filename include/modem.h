@@ -115,11 +115,16 @@ int modem_dbm_to_bars(int dbm);
 int modem_build_telemetry(at_context_t *at, modem_telemetry_t *telem, call_state_t call_state);
 
 /**
- * @brief Enable echo cancellation on an active call.
+ * @brief Per-call audio setup: echo cancellation + USB PCM.
  *
- * AT+CECM=1 only works during an active voice call on the SIM7600.
- * Called when VOICE CALL: BEGIN or CONNECT is detected.
+ * AT+CECM=1, AT+CPCMFRM=1 (16 kHz wideband) and AT+CPCMREG=1 (start USB PCM on
+ * ttyUSB4) only work during an active voice call on the SIM7600 — they return
+ * ERROR at idle.  Called when VOICE CALL: BEGIN or CONNECT is detected.
+ * AT+CPCMFRM resets to 8 kHz on modem reset, so it is set per call.
+ *
+ * @return true if USB PCM was armed (AT+CPCMREG=1 returned OK) so the caller can
+ *         publish a pcm_ready event; false if PCM did not start.
  */
-void modem_call_audio_setup(at_context_t *at);
+bool modem_call_audio_setup(at_context_t *at);
 
 #endif /* MODEM_H */
