@@ -274,14 +274,30 @@ bool modem_call_audio_setup(at_context_t *at) {
       OLOG_WARNING("USB PCM 16 kHz set failed (AT+CPCMFRM=1)");
    }
 
-   /* Start USB PCM transfer on ttyUSB4.  This is what makes call audio flow to
-    * DAWN; gate pcm_ready on its success. */
+   /* Start USB PCM transfer on the modem's USB audio interface (DAWN opens the
+    * corresponding /dev node).  This is what makes call audio flow to DAWN; gate
+    * pcm_ready on its success. */
    if (at_command_send(at, "AT+CPCMREG=1", &resp, AT_TIMEOUT_DEFAULT) == AT_OK) {
-      OLOG_INFO("USB PCM started (ttyUSB4, 16 kHz S16LE)");
+      OLOG_INFO("USB PCM started (16 kHz S16LE)");
       return true;
    }
    OLOG_WARNING("USB PCM start failed (AT+CPCMREG=1) — no call audio to DAWN");
    return false;
+}
+
+void modem_call_audio_teardown(at_context_t *at) {
+   at_response_t resp;
+   /* Stop USB PCM (AT+CPCMREG=0), the teardown half of the SIMCom USB-audio
+    * sequence.  Best-effort: at idle the SIM7600 returns ERROR, and if the call
+    * already dropped the USB device may have re-enumerated so the AT port is
+    * gone — either way this is non-fatal.  Sending it BEFORE a local hangup
+    * (while the call + port are still up) is what lets the modem drop USB audio
+    * cleanly instead of re-enumerating the whole USB device at an abrupt end. */
+   if (at_command_send(at, "AT+CPCMREG=0", &resp, AT_TIMEOUT_DEFAULT) == AT_OK) {
+      OLOG_INFO("USB PCM stopped (AT+CPCMREG=0)");
+   } else {
+      OLOG_INFO("USB PCM stop skipped (AT+CPCMREG=0 non-OK — idle or port gone)");
+   }
 }
 
 /* ── Heartbeat ───────────────────────────────────────────────────────── */

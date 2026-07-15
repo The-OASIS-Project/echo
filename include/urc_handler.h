@@ -68,12 +68,15 @@ typedef void (*urc_event_callback_t)(const urc_event_t *event, void *userdata);
 typedef struct {
    at_context_t *at_ctx;          /* shared AT context (serial fd + pending state) */
    pthread_t thread;              /* reader thread handle */
+   bool started;                  /* true between a successful urc_start and urc_stop */
    volatile bool running;         /* set to false to stop the reader */
    urc_event_callback_t callback; /* event callback */
    void *userdata;                /* opaque userdata for callback */
 
-   /* Optional: set to 0 on fatal serial error to trigger daemon shutdown */
-   volatile sig_atomic_t *shutdown_flag;
+   /* Optional: set to 1 when the serial device disconnects (device gone / read
+    * error while still running) so the main loop can reconnect in-process rather
+    * than exit. NULL if the caller doesn't want reconnect signalling. */
+   volatile sig_atomic_t *disconnect_flag;
 
    /* RING+CLIP merge state */
    bool ring_pending;         /* RING received, waiting for CLIP */
@@ -94,19 +97,24 @@ typedef struct {
 /**
  * @brief Start the URC reader thread.
  *
- * @param ctx       URC context to initialize.
- * @param at_ctx    AT context with open serial port.
- * @param callback  Function called for each URC event.
- * @param userdata  Opaque pointer passed to callback.
+ * @param ctx             URC context to initialize.
+ * @param at_ctx          AT context with open serial port.
+ * @param callback        Function called for each URC event.
+ * @param userdata        Opaque pointer passed to callback.
+ * @param disconnect_flag Optional flag (may be NULL) set to 1 if the reader exits
+ *                        on a device disconnect.  Wired before the thread starts
+ *                        so an immediate drop can never be missed.
  * @return 0 on success, -1 on error.
  */
 int urc_start(urc_context_t *ctx,
               at_context_t *at_ctx,
               urc_event_callback_t callback,
-              void *userdata);
+              void *userdata,
+              volatile sig_atomic_t *disconnect_flag);
 
 /**
- * @brief Stop the URC reader thread and wait for it to exit.
+ * @brief Stop the URC reader thread and wait for it to exit. Idempotent: a call
+ *        when no reader is running (never started, or already stopped) is a no-op.
  */
 void urc_stop(urc_context_t *ctx);
 

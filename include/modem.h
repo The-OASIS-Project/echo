@@ -118,13 +118,24 @@ int modem_build_telemetry(at_context_t *at, modem_telemetry_t *telem, call_state
  * @brief Per-call audio setup: echo cancellation + USB PCM.
  *
  * AT+CECM=1, AT+CPCMFRM=1 (16 kHz wideband) and AT+CPCMREG=1 (start USB PCM on
- * ttyUSB4) only work during an active voice call on the SIM7600 — they return
- * ERROR at idle.  Called when VOICE CALL: BEGIN or CONNECT is detected.
- * AT+CPCMFRM resets to 8 kHz on modem reset, so it is set per call.
+ * the modem's USB audio interface) only work during an active voice call on the
+ * SIM7600 — they return ERROR at idle.  Called when VOICE CALL: BEGIN or CONNECT
+ * is detected.  AT+CPCMFRM resets to 8 kHz on modem reset, so it is set per call.
  *
  * @return true if USB PCM was armed (AT+CPCMREG=1 returned OK) so the caller can
  *         publish a pcm_ready event; false if PCM did not start.
  */
 bool modem_call_audio_setup(at_context_t *at);
+
+/**
+ * @brief Per-call audio teardown: stop USB PCM (AT+CPCMREG=0).
+ *
+ * The teardown half of the SIMCom USB-audio sequence.  Best-effort / non-fatal:
+ * returns ERROR at idle and may fail if the call already dropped and the USB
+ * device re-enumerated.  Send it BEFORE a local hangup (while the call + USB
+ * port are still up) so the modem drops USB audio cleanly instead of
+ * re-enumerating the whole USB device at an abrupt call end.
+ */
+void modem_call_audio_teardown(at_context_t *at);
 
 #endif /* MODEM_H */

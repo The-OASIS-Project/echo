@@ -27,10 +27,12 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/file.h>
+#include <sys/stat.h>
 #include <termios.h>
 #include <time.h>
 #include <unistd.h>
@@ -65,21 +67,18 @@ static speed_t baud_to_speed(int baud) {
    }
 }
 
-/**
- * @brief Validate that a serial port path looks safe.
- *
- * Only allows /dev/ttyUSB* and /dev/ttyACM* to prevent path traversal.
- */
-static bool validate_serial_path(const char *path) {
-   if (!path || path[0] == '\0') {
-      return false;
-   }
+/* NOTE: the serial-path acceptance rule below (is_raw_tty_node / is_serial_alias
+ * / validate_serial_path) is mirrored in DAWN's src/tools/phone_audio_config.c
+ * (phone_pcm_port_validate) — the two daemons are independent binaries with no
+ * shared lib, so this is a deliberate copy. Keep the two in sync if you change
+ * what a valid modem serial/PCM path looks like. */
 
-   /* Check prefix */
-   size_t prefix_len = 0;
-   if (strncmp(path, "/dev/ttyUSB", 11) == 0) {
-      prefix_len = 11;
-   } else if (strncmp(path, "/dev/ttyACM", 11) == 0) {
+/**
+ * @brief A raw /dev/ttyUSB<n> or /dev/ttyACM<n> node (1-3 digit suffix).
+ */
+static bool is_raw_tty_node(const char *path) {
+   size_t prefix_len;
+   if (strncmp(path, "/dev/ttyUSB", 11) == 0 || strncmp(path, "/dev/ttyACM", 11) == 0) {
       prefix_len = 11;
    } else {
       return false;
@@ -99,6 +98,42 @@ static bool validate_serial_path(const char *path) {
    return true;
 }
 
+/**
+ * @brief A udev stable-alias path under /dev/serial/by-id/ or /dev/serial/by-path/.
+ *
+ * Must name a single entry: non-empty, no '/' in the name (no nested path) and
+ * no ".." token.  These aliases are immune to ttyUSB enumeration-order shifts.
+ */
+static bool is_serial_alias(const char *path) {
+   const char *name;
+   if (strncmp(path, "/dev/serial/by-id/", 18) == 0) {
+      name = path + 18;
+   } else if (strncmp(path, "/dev/serial/by-path/", 20) == 0) {
+      name = path + 20;
+   } else {
+      return false;
+   }
+   if (name[0] == '\0' || strchr(name, '/') != NULL || strstr(name, "..") != NULL) {
+      return false;
+   }
+   return true;
+}
+
+/**
+ * @brief Validate that a serial port path looks safe (pure syntax check).
+ *
+ * Accepts a raw /dev/ttyUSB<n> / /dev/ttyACM<n> node, or a udev stable alias
+ * under /dev/serial/by-id/ or /dev/serial/by-path/.  Aliases are resolved and
+ * re-validated against the raw-node rule in at_open() (realpath), so the actual
+ * open() only ever lands on a ttyUSB/ttyACM node — path traversal stays blocked.
+ */
+bool validate_serial_path(const char *path) {
+   if (!path || path[0] == '\0') {
+      return false;
+   }
+   return is_raw_tty_node(path) || is_serial_alias(path);
+}
+
 /* ── Serial port ─────────────────────────────────────────────────────── */
 
 int at_open(at_context_t *ctx, const char *port, int baud) {
@@ -110,23 +145,58 @@ int at_open(at_context_t *ctx, const char *port, int baud) {
    ctx->fd = -1;
 
    if (!validate_serial_path(port)) {
-      OLOG_ERROR("Invalid serial port path: %s (must be /dev/ttyUSB* or /dev/ttyACM*)", port);
+      OLOG_ERROR("Invalid serial port path: %s (need /dev/ttyUSB*/ttyACM* or a "
+                 "/dev/serial/by-id|by-path alias)",
+                 port);
       return -1;
    }
 
-   snprintf(ctx->path, sizeof(ctx->path), "%s", port);
+   /* Resolve to the concrete /dev/ttyUSB<n> node: a raw path resolves to itself,
+    * a stable alias resolves through its symlink, and either way the target must
+    * be a raw ttyUSB/ttyACM node.  We open the RESOLVED path (never the alias),
+    * so the by-id indirection is honored while open() lands on a validated node
+    * with O_NOFOLLOW meaningful (the resolved node is not itself a symlink). */
+   char resolved[PATH_MAX]; /* realpath() writes up to PATH_MAX — don't shrink */
+   if (!realpath(port, resolved) || !is_raw_tty_node(resolved)) {
+      OLOG_ERROR("Serial port %s does not resolve to a /dev/ttyUSB*/ttyACM* node", port);
+      return -1;
+   }
+   if (strcmp(resolved, port) != 0) {
+      OLOG_INFO("Serial port %s -> %s", port, resolved);
+   }
+
+   /* is_raw_tty_node() bounds resolved to ~15 chars, but realpath()'s buffer is
+    * PATH_MAX; the explicit guard keeps ctx->path[128] safe and silences the
+    * -Wformat-truncation heuristic. */
+   size_t rlen = strlen(resolved);
+   if (rlen >= sizeof(ctx->path)) {
+      OLOG_ERROR("Resolved serial path too long (%zu bytes): %s", rlen, resolved);
+      return -1;
+   }
+   memcpy(ctx->path, resolved, rlen + 1);
    ctx->baud = baud;
 
-   /* Open in non-blocking mode first to avoid hanging on modem lines */
-   ctx->fd = open(port, O_RDWR | O_NOCTTY | O_NONBLOCK);
+   /* Open in non-blocking mode first to avoid hanging on modem lines.
+    * O_NOFOLLOW: the resolved node must not be a symlink swapped in after
+    * realpath(). O_CLOEXEC: don't leak the modem fd across exec. */
+   ctx->fd = open(resolved, O_RDWR | O_NOCTTY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC);
    if (ctx->fd < 0) {
-      OLOG_ERROR("Failed to open %s: %s", port, strerror(errno));
+      OLOG_ERROR("Failed to open %s: %s", resolved, strerror(errno));
+      return -1;
+   }
+
+   /* Confirm we opened an actual character device, not a regular file. */
+   struct stat st;
+   if (fstat(ctx->fd, &st) != 0 || !S_ISCHR(st.st_mode)) {
+      OLOG_ERROR("%s is not a character device", resolved);
+      close(ctx->fd);
+      ctx->fd = -1;
       return -1;
    }
 
    /* Acquire exclusive lock */
    if (flock(ctx->fd, LOCK_EX | LOCK_NB) < 0) {
-      OLOG_ERROR("Failed to lock %s (another process owns it): %s", port, strerror(errno));
+      OLOG_ERROR("Failed to lock %s (another process owns it): %s", resolved, strerror(errno));
       close(ctx->fd);
       ctx->fd = -1;
       return -1;
@@ -192,10 +262,15 @@ void at_close(at_context_t *ctx) {
       close(ctx->fd);
       OLOG_INFO("Serial port %s closed", ctx->path);
       ctx->fd = -1;
+      /* The sync primitives are initialized only on a fully-successful at_open
+       * (below the fd-open, always with fd >= 0), so destroy them here inside the
+       * fd guard.  This makes at_close idempotent: a second call — e.g. the
+       * shutdown teardown after handle_serial_reconnect already closed on a
+       * never-returning modem — is a safe no-op instead of a double-destroy. */
+      pthread_mutex_destroy(&ctx->pending.mutex);
+      pthread_cond_destroy(&ctx->pending.cond);
+      pthread_mutex_destroy(&ctx->write_mutex);
    }
-   pthread_mutex_destroy(&ctx->pending.mutex);
-   pthread_cond_destroy(&ctx->pending.cond);
-   pthread_mutex_destroy(&ctx->write_mutex);
 }
 
 /* ── Write ───────────────────────────────────────────────────────────── */

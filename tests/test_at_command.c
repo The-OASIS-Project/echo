@@ -107,6 +107,42 @@ void test_parse_empty(void) {
    TEST_ASSERT_FALSE(at_parse_terminator("", &status, &err_code));
 }
 
+/* ── Serial-path validation ──────────────────────────────────────────── */
+
+void test_serial_path_accept_raw(void) {
+   TEST_ASSERT_TRUE(validate_serial_path("/dev/ttyUSB0"));
+   TEST_ASSERT_TRUE(validate_serial_path("/dev/ttyUSB2"));
+   TEST_ASSERT_TRUE(validate_serial_path("/dev/ttyUSB100"));
+   TEST_ASSERT_TRUE(validate_serial_path("/dev/ttyACM0"));
+}
+
+void test_serial_path_accept_alias(void) {
+   TEST_ASSERT_TRUE(validate_serial_path(
+       "/dev/serial/by-id/usb-SimTech__Incorporated_0123456789ABCDEF-if04-port0"));
+   TEST_ASSERT_TRUE(
+       validate_serial_path("/dev/serial/by-path/platform-3610000.xhci-usb-0:2.1:1.4"));
+}
+
+void test_serial_path_reject_null_empty(void) {
+   TEST_ASSERT_FALSE(validate_serial_path(NULL));
+   TEST_ASSERT_FALSE(validate_serial_path(""));
+}
+
+void test_serial_path_reject_bad_raw(void) {
+   TEST_ASSERT_FALSE(validate_serial_path("/dev/ttyUSB"));             /* no digits */
+   TEST_ASSERT_FALSE(validate_serial_path("/dev/ttyUSBfoo"));          /* non-digit suffix */
+   TEST_ASSERT_FALSE(validate_serial_path("/dev/ttyUSB1234"));         /* > 3 digits */
+   TEST_ASSERT_FALSE(validate_serial_path("/etc/passwd"));             /* wrong prefix */
+   TEST_ASSERT_FALSE(validate_serial_path("/dev/ttyUSB0 ; rm -rf /")); /* trailing junk */
+}
+
+void test_serial_path_reject_bad_alias(void) {
+   TEST_ASSERT_FALSE(validate_serial_path("/dev/serial/by-id/"));                 /* empty name */
+   TEST_ASSERT_FALSE(validate_serial_path("/dev/serial/by-id/a/b"));              /* nested path */
+   TEST_ASSERT_FALSE(validate_serial_path("/dev/serial/by-id/../../etc/passwd")); /* traversal */
+   TEST_ASSERT_FALSE(validate_serial_path("/dev/serial/by-idX/foo"));             /* wrong prefix */
+}
+
 /* ── Status string ───────────────────────────────────────────────────── */
 
 void test_status_str_ok(void) {
@@ -137,6 +173,11 @@ int main(void) {
    RUN_TEST(test_parse_not_terminator_ring);
    RUN_TEST(test_parse_null);
    RUN_TEST(test_parse_empty);
+   RUN_TEST(test_serial_path_accept_raw);
+   RUN_TEST(test_serial_path_accept_alias);
+   RUN_TEST(test_serial_path_reject_null_empty);
+   RUN_TEST(test_serial_path_reject_bad_raw);
+   RUN_TEST(test_serial_path_reject_bad_alias);
    RUN_TEST(test_status_str_ok);
    RUN_TEST(test_status_str_timeout);
    RUN_TEST(test_status_str_port_error);

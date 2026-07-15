@@ -76,6 +76,19 @@ typedef struct {
 } at_context_t;
 
 /**
+ * @brief Validate a serial-port path (pure syntax check; exposed for testing).
+ *
+ * Accepts a raw /dev/ttyUSB<n> / /dev/ttyACM<n> node (1-3 digit suffix) or a
+ * udev stable alias under /dev/serial/by-id/ or /dev/serial/by-path/ (a single
+ * path component — no '/', no ".."). Does not touch the filesystem. at_open()
+ * additionally realpath()-resolves an alias and re-checks the resolved target is
+ * a raw node, so open() only ever lands on a ttyUSB/ttyACM device.
+ *
+ * @return true if @p path is syntactically an acceptable serial-port path.
+ */
+bool validate_serial_path(const char *path);
+
+/**
  * @brief Open the serial port with exclusive lock (flock).
  * @return 0 on success, -1 on error.
  */

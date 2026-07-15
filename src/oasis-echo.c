@@ -45,7 +45,20 @@
 
 static volatile sig_atomic_t g_running = 1;
 static volatile sig_atomic_t g_signal_shutdown = 0;
+/* Set by the URC reader when the serial device disconnects; the main loop then
+ * reconnects in-process (SIM7600 re-enumerates its USB on call-audio teardown)
+ * instead of exiting for a systemd restart. */
+static volatile sig_atomic_t g_serial_lost = 0;
+/* True while USB PCM is registered (AT+CPCMREG=1) for an active call. Guards the
+ * best-effort CPCMREG=0 teardown so we never poke it at idle. __atomic-accessed
+ * (set on the main thread, read on the URC reader thread). */
+static int g_pcm_active = 0;
 static at_context_t g_at_ctx;
+
+/* In-process serial reconnect backoff (seconds): the SIM7600 takes ~15-20s to
+ * re-enumerate its USB, so retry-open with a capped exponential backoff. */
+#define RECONNECT_BACKOFF_MIN_S 1
+#define RECONNECT_BACKOFF_MAX_S 8
 static rate_bucket_t g_call_bucket;
 static rate_bucket_t g_sms_bucket;
 static rate_bucket_t g_segment_bucket;
@@ -84,6 +97,7 @@ typedef enum {
    CMD_TYPE_MQTT = 0,       /* MQTT command from echo/cmd */
    CMD_TYPE_CMTI,           /* Deferred SMS read from URC_CMTI */
    CMD_TYPE_CALL_CONNECTED, /* Deferred call audio setup */
+   CMD_TYPE_CALL_ENDED,     /* Deferred call audio teardown (best-effort CPCMREG=0) */
 } cmd_type_t;
 
 typedef struct {
@@ -209,6 +223,24 @@ static bool validate_dtmf(char c) {
 
 /* ── URC event handler (runs on URC reader thread — keep fast) ───────── */
 
+/* Queue a best-effort USB-audio teardown to the main thread when a call ends.
+ * Runs from the URC reader, which can't send AT commands itself (it would wait
+ * for its own response), so the CPCMREG=0 goes on the deferred queue.  Gated on
+ * g_pcm_active so we don't poke CPCMREG at idle.  On a far-end hangup the modem
+ * may already have re-enumerated (port gone) — the teardown then no-ops and the
+ * reconnect path takes over; on a graceful end it clears CPCMREG cleanly. */
+static void queue_call_audio_teardown(void) {
+   if (!__atomic_load_n(&g_pcm_active, __ATOMIC_ACQUIRE)) {
+      return;
+   }
+   cmd_entry_t cmd;
+   memset(&cmd, 0, sizeof(cmd));
+   cmd.type = CMD_TYPE_CALL_ENDED;
+   if (!cmd_queue_push(&g_deferred_queue, &cmd)) {
+      OLOG_WARNING("Deferred queue full, dropping call-audio teardown");
+   }
+}
+
 static void on_urc_event(const urc_event_t *event, void *userdata) {
    (void)userdata;
 
@@ -259,6 +291,7 @@ static void on_urc_event(const urc_event_t *event, void *userdata) {
          }
          set_call_state(CALL_STATE_IDLE);
          set_last_ring_time(0);
+         queue_call_audio_teardown(); /* graceful CPCMREG=0 (best-effort) */
          const char *reason = (prev == CALL_STATE_DIALING) ? "no_carrier" : "remote_hangup";
          struct json_object *extra = json_object_new_object();
          json_object_object_add(extra, "reason", json_object_new_string(reason));
@@ -307,6 +340,7 @@ static void on_urc_event(const urc_event_t *event, void *userdata) {
             break;
          }
          set_call_state(CALL_STATE_IDLE);
+         queue_call_audio_teardown(); /* graceful CPCMREG=0 (best-effort) */
          {
             struct json_object *extra = json_object_new_object();
             json_object_object_add(extra, "reason", json_object_new_string("voice_call_end"));
@@ -438,6 +472,13 @@ static void process_mqtt_command(const cmd_entry_t *cmd) {
    /* hangup — AT+CHUP works in all call states on SIM7600 (ATH does not) */
    if (strcmp(action, "hangup") == 0) {
       call_state_t prev = get_call_state();
+      /* Gracefully stop USB audio BEFORE hanging up, while the call + USB port
+       * are still alive — an abrupt call-end with audio still registered makes
+       * the SIM7600 re-enumerate its whole USB device. */
+      if (__atomic_load_n(&g_pcm_active, __ATOMIC_ACQUIRE)) {
+         modem_call_audio_teardown(&g_at_ctx);
+         __atomic_store_n(&g_pcm_active, 0, __ATOMIC_RELEASE);
+      }
       set_call_state(CALL_STATE_HANGING_UP);
       at_response_t resp;
       at_status_t rc = at_command_send(&g_at_ctx, "AT+CHUP", &resp, AT_TIMEOUT_DEFAULT);
@@ -613,6 +654,87 @@ static void print_usage(const char *prog) {
    printf("  -v, --version            Show version\n");
 }
 
+/* ── Modem bring-up / reconnect ──────────────────────────────────────── */
+
+/* Open the serial port, start the URC reader, and run modem init.  Shared by
+ * startup and the in-process reconnect path.  On any failure it tears down
+ * whatever it opened and returns 1 (leaving nothing running); on success the
+ * URC reader is running and wired to signal g_serial_lost on a future drop. */
+static int establish_modem(urc_context_t *urc_ctx, const echo_config_t *config) {
+   if (at_open(&g_at_ctx, config->serial_port, config->serial_baud) != 0) {
+      return 1;
+   }
+   if (urc_start(urc_ctx, &g_at_ctx, on_urc_event, NULL, &g_serial_lost) != 0) {
+      at_close(&g_at_ctx);
+      return 1;
+   }
+   if (modem_init(&g_at_ctx, config->pdu_mode) != 0) {
+      urc_stop(urc_ctx);
+      at_close(&g_at_ctx);
+      return 1;
+   }
+   return 0;
+}
+
+/* Recover in-process from a serial disconnect (the SIM7600 re-enumerating its
+ * USB after call-audio teardown) instead of exiting for a systemd restart:
+ * reap the dead reader, close the stale fd, and retry establish with capped
+ * backoff until it comes back or we're asked to shut down.  MQTT stays up
+ * throughout, so DAWN gets a modem_lost on the way down and online on recovery. */
+static void handle_serial_reconnect(urc_context_t *urc_ctx, const echo_config_t *config) {
+   OLOG_WARNING("Serial device lost — reconnecting in-process (modem likely re-enumerating)");
+   set_call_state(CALL_STATE_IDLE);
+   __atomic_store_n(&g_pcm_active, 0, __ATOMIC_RELEASE);
+
+   char json[256];
+   if (mqtt_build_event_json("modem_lost", NULL, json, sizeof(json)) >= 0) {
+      mqtt_publish_event(json);
+   }
+
+   urc_stop(urc_ctx);   /* reap the already-exited reader thread */
+   at_close(&g_at_ctx); /* close the dead fd */
+   /* URC-originated deferred work is stale after a re-enumeration; MQTT commands
+    * (g_cmd_queue) are left intact so a queued dial/hangup still runs. */
+   cmd_queue_init(&g_deferred_queue);
+
+   int backoff = RECONNECT_BACKOFF_MIN_S;
+   int attempts = 0;
+   while (g_running) {
+      sleep(backoff); /* interrupted by SIGINT/SIGTERM, which clears g_running */
+      if (!g_running) {
+         return;
+      }
+      g_serial_lost = 0; /* fresh attempt — ignore a flag left by a prior try */
+      if (establish_modem(urc_ctx, config) == 0 && !g_serial_lost) {
+         OLOG_INFO("Serial device reconnected after %d attempt(s)", attempts + 1);
+         /* Symmetric to the modem_lost event on the way down: DAWN clears its
+          * modem-lost state on the modem_reconnected EVENT (not on echo/status),
+          * so emit both. */
+         char json[256];
+         if (mqtt_build_event_json("modem_reconnected", NULL, json, sizeof(json)) >= 0) {
+            mqtt_publish_event(json);
+         }
+         mqtt_publish_status_online();
+         return;
+      }
+      /* Either establish failed, or a freshly-started reader already saw another
+       * drop.  Tear down anything half-up (both calls are idempotent) and back
+       * off.  Log the first few then throttle so a permanently-absent modem
+       * doesn't flood the log; at_open still logs its own error per attempt. */
+      urc_stop(urc_ctx);
+      at_close(&g_at_ctx);
+      attempts++;
+      backoff *= 2;
+      if (backoff > RECONNECT_BACKOFF_MAX_S) {
+         backoff = RECONNECT_BACKOFF_MAX_S;
+      }
+      if (attempts <= 3 || attempts % 20 == 0) {
+         OLOG_WARNING("Serial reconnect still failing (attempt %d); retrying every %ds", attempts,
+                      backoff);
+      }
+   }
+}
+
 /* ── Main ────────────────────────────────────────────────────────────── */
 
 int main(int argc, char *argv[]) {
@@ -772,28 +894,10 @@ int main(int argc, char *argv[]) {
    g_sms_io.inter_segment_delay_ms = config.inter_segment_delay_ms;
    g_sms_io.pdu_mode = config.pdu_mode;
 
-   /* Open serial port */
-   if (at_open(&g_at_ctx, config.serial_port, config.serial_baud) != 0) {
-      OLOG_ERROR("Failed to open serial port — exiting");
-      close_logging();
-      return 1;
-   }
-
-   /* Start URC reader thread */
+   /* Open serial port, start the URC reader, and run modem init. */
    urc_context_t urc_ctx;
-   if (urc_start(&urc_ctx, &g_at_ctx, on_urc_event, NULL) != 0) {
-      OLOG_ERROR("Failed to start URC reader — exiting");
-      at_close(&g_at_ctx);
-      close_logging();
-      return 1;
-   }
-   urc_ctx.shutdown_flag = &g_running;
-
-   /* Run modem init sequence */
-   if (modem_init(&g_at_ctx, config.pdu_mode) != 0) {
-      OLOG_ERROR("Modem init failed — exiting");
-      urc_stop(&urc_ctx);
-      at_close(&g_at_ctx);
+   if (establish_modem(&urc_ctx, &config) != 0) {
+      OLOG_ERROR("Failed to bring up modem — exiting");
       close_logging();
       return 1;
    }
@@ -819,6 +923,13 @@ int main(int argc, char *argv[]) {
    int heartbeat_failures = 0;
 
    while (g_running) {
+      /* Serial device dropped (e.g. modem re-enumerating its USB after a call) —
+       * reconnect in-process instead of exiting; skip this tick's work. */
+      if (g_serial_lost) {
+         handle_serial_reconnect(&urc_ctx, &config);
+         continue;
+      }
+
       time_t now = time(NULL);
 
       /* Drain MQTT commands first so a newly-arrived hangup/dial never waits
@@ -838,13 +949,24 @@ int main(int argc, char *argv[]) {
             handle_cmti(cmd.sms_index);
          } else if (cmd.type == CMD_TYPE_CALL_CONNECTED) {
             /* Arm echo cancel + USB PCM (per-call AT commands).  Only announce
-             * pcm_ready once CPCMREG=1 succeeded, so DAWN opens ttyUSB4 exactly
-             * when audio is flowing — no startup race. */
+             * pcm_ready once CPCMREG=1 succeeded, so DAWN opens the PCM port
+             * exactly when audio is flowing — no startup race. */
             if (modem_call_audio_setup(&g_at_ctx)) {
+               __atomic_store_n(&g_pcm_active, 1, __ATOMIC_RELEASE);
                char json[256];
                if (mqtt_build_event_json("pcm_ready", NULL, json, sizeof(json)) >= 0) {
                   mqtt_publish_event(json);
                }
+            }
+         } else if (cmd.type == CMD_TYPE_CALL_ENDED) {
+            /* Best-effort graceful USB-audio teardown (CPCMREG=0) after a call
+             * ended via URC.  Re-check g_pcm_active at the point of action: a
+             * local hangup that drained just before this may have already torn
+             * down PCM, so this avoids a redundant CPCMREG=0 round-trip.
+             * Non-fatal — see modem_call_audio_teardown(). */
+            if (__atomic_load_n(&g_pcm_active, __ATOMIC_ACQUIRE)) {
+               modem_call_audio_teardown(&g_at_ctx);
+               __atomic_store_n(&g_pcm_active, 0, __ATOMIC_RELEASE);
             }
          }
          last_at_success = time(NULL);
@@ -915,6 +1037,12 @@ int main(int argc, char *argv[]) {
             OLOG_WARNING("Modem heartbeat failed (%d consecutive)", heartbeat_failures);
 
             if (heartbeat_failures >= 3) {
+               /* Modem is unresponsive but its /dev node is still present (else
+                * the reader's disconnect detection would have driven the
+                * in-process reconnect instead).  We only surface modem_lost here;
+                * recovery relies on the modem answering AT again on its own — a
+                * wedged-but-enumerated modem is not re-established by this path,
+                * unlike a USB re-enumeration (handled by handle_serial_reconnect). */
                OLOG_ERROR("Modem unresponsive — publishing modem_lost event");
                char json[256];
                if (mqtt_build_event_json("modem_lost", NULL, json, sizeof(json)) >= 0) {
@@ -934,12 +1062,21 @@ int main(int argc, char *argv[]) {
    /* ── Shutdown ───────────────────────────────────────────────────── */
    OLOG_INFO("Shutting down ECHO daemon...");
 
+   /* If a call was still up (SIGTERM mid-call), stop USB audio gracefully so the
+    * modem doesn't re-enumerate USB for whoever opens it next.  Skipped when the
+    * port is already gone (reconnect cleared g_pcm_active). */
+   if (__atomic_load_n(&g_pcm_active, __ATOMIC_ACQUIRE)) {
+      modem_call_audio_teardown(&g_at_ctx);
+   }
+
    mqtt_comms_cleanup();
    urc_stop(&urc_ctx);
    at_close(&g_at_ctx);
 
+   /* The loop now only exits on a signal (a serial disconnect reconnects
+    * in-process rather than clearing g_running), so this is the clean path. */
    if (!g_signal_shutdown) {
-      OLOG_ERROR("Exiting due to serial device failure (exit code 1)");
+      OLOG_ERROR("Main loop exited without a shutdown signal (exit code 1)");
    }
 
    close_logging();

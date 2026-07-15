@@ -15,9 +15,12 @@ Part of [The OASIS Project](https://github.com/The-OASIS-Project/).
 ## Hardware
 
 - **Modem**: Waveshare SIM7600G-H 4G HAT (USB, SIMCom chipset)
-- **Serial**: `/dev/ttyUSB2` at 115200 baud (AT command port)
+- **Serial**: AT command port (if04) at 115200 baud. Prefer a stable
+  `/dev/serial/by-id/…-if04-port0` alias over a raw `/dev/ttyUSBn` — raw numbers
+  reshuffle when another USB-serial device is added (`ls -l /dev/serial/by-id/`).
 - **Network**: RNDIS via `usb0` (tertiary internet, route-metric 20100)
-- **Audio**: 3.5mm analog jack with crossover cable to USB sound card
+- **Audio**: USB PCM (per-call) over the modem's audio interface (if06); DAWN
+  bridges it to the local handset. No analog jack / crossover cable involved.
 - **SIM**: US Mobile (T-Mobile MVNO)
 
 ## Building
@@ -32,7 +35,7 @@ make -C build -j8
 ```bash
 # Interactive (console logging)
 ./build/oasis-echo \
-  --serial-port /dev/ttyUSB2 \
+  --serial-port /dev/serial/by-id/usb-SimTech__Incorporated_SimTech__Incorporated_0123456789ABCDEF-if04-port0 \
   --mqtt-host localhost --mqtt-port 1883 \
   --mqtt-username oasis --mqtt-password 'yourpass'
 
@@ -116,7 +119,9 @@ sudo systemctl enable --now oasis-echo
 - SMS body sanitization: Ctrl-Z (0x1A) and ESC (0x1B) rejected entirely — prevents AT command injection
 - SMS index validation: digits only (0-999) for read/delete
 - DTMF validation: `[0-9*#A-D]` only
-- Serial port path: allowlist `/dev/ttyUSB[0-9]` and `/dev/ttyACM[0-9]`
+- Serial port path: allowlist `/dev/ttyUSB[0-9]{1,3}`, `/dev/ttyACM[0-9]{1,3}`, or a
+  `/dev/serial/by-id|by-path/` alias — an alias is `realpath()`-resolved and must land
+  on a raw ttyUSB/ttyACM node, then opened `O_NOFOLLOW` and confirmed a character device
 - Rate limiting: configurable calls/hour and SMS/hour
 - MQTT: TLS + authentication supported, LWT for status
 - systemd: NoNewPrivileges, ProtectSystem, ProtectHome, non-root user

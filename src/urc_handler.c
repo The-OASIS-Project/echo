@@ -378,8 +378,11 @@ static void *urc_reader_thread(void *arg) {
       }
    }
 
-   if (ctx->shutdown_flag) {
-      *ctx->shutdown_flag = 0;
+   /* If we left the loop while still "running", the device disconnected or a read
+    * errored (not a deliberate urc_stop()) — flag main to reconnect, don't quit.
+    * A deliberate stop clears ctx->running first, so this is skipped for it. */
+   if (ctx->running && ctx->disconnect_flag) {
+      *ctx->disconnect_flag = 1;
    }
    OLOG_INFO("URC reader thread exiting");
    return NULL;
@@ -390,7 +393,8 @@ static void *urc_reader_thread(void *arg) {
 int urc_start(urc_context_t *ctx,
               at_context_t *at_ctx,
               urc_event_callback_t callback,
-              void *userdata) {
+              void *userdata,
+              volatile sig_atomic_t *disconnect_flag) {
    if (!ctx || !at_ctx) {
       return -1;
    }
@@ -401,21 +405,27 @@ int urc_start(urc_context_t *ctx,
    ctx->userdata = userdata;
    ctx->running = true;
    ctx->ring_pending = false;
+   /* Wire the disconnect flag BEFORE the thread starts so a drop in the first
+    * microseconds of the reader's life is still signalled (the reader reads it
+    * on its exit path). */
+   ctx->disconnect_flag = disconnect_flag;
 
    if (pthread_create(&ctx->thread, NULL, urc_reader_thread, ctx) != 0) {
       OLOG_ERROR("Failed to create URC reader thread: %s", strerror(errno));
       return -1;
    }
+   ctx->started = true;
 
    return 0;
 }
 
 void urc_stop(urc_context_t *ctx) {
-   if (!ctx) {
-      return;
+   if (!ctx || !ctx->started) {
+      return; /* never started, or already stopped — idempotent no-op */
    }
 
    ctx->running = false;
    pthread_join(ctx->thread, NULL);
+   ctx->started = false;
    OLOG_INFO("URC reader thread stopped");
 }
