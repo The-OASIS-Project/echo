@@ -112,7 +112,7 @@ Replaced `AT+CSCS="GSM"` approach with native UCS2 encoding for full Unicode/emo
 | Send emoji (🎯 U+1F3AF) | Pass | Surrogate pair D83C DFAF, delivered correctly |
 | Send multi-emoji SMS | Pass | "Jarvis 🤖⚙️🦾🔴🚀" — all emoji arrived on phone |
 | Receive emoji SMS | Pass | "Friday!!! 🙂😅😁" decoded from UCS2 hex to UTF-8 |
-| Receive SMS sender decode | Pass | UCS2 hex sender decoded to "+16786432695" |
+| Receive SMS sender decode | Pass | UCS2 hex sender decoded to "+14045550142" |
 | MMS (image) receive | Blank | Empty sender/body — MMS requires separate MMSC fetch (Phase 6) |
 | UCS2 encode/decode roundtrip | Pass | Unit tested: ASCII, phone numbers, emoji, surrogate pairs (10 assertions) |
 

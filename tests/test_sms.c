@@ -174,10 +174,10 @@ void test_ucs2_encode_ascii(void) {
 
 void test_ucs2_encode_phone_number(void) {
    char hex[128];
-   int len = sms_utf8_to_ucs2_hex("+16786432695", hex, sizeof(hex));
+   int len = sms_utf8_to_ucs2_hex("+14045550142", hex, sizeof(hex));
    TEST_ASSERT_GREATER_THAN(0, len);
    /* + = 002B, 1 = 0031, etc. */
-   TEST_ASSERT_EQUAL_STRING("002B00310036003700380036003400330032003600390035", hex);
+   TEST_ASSERT_EQUAL_STRING("002B00310034003000340035003500350030003100340032", hex);
 }
 
 void test_ucs2_encode_emoji(void) {
@@ -205,9 +205,9 @@ void test_ucs2_decode_ascii(void) {
 
 void test_ucs2_decode_phone_number(void) {
    char utf8[32];
-   int len = sms_ucs2_hex_to_utf8("002B00310036003700380036003400330032003600390035", utf8,
+   int len = sms_ucs2_hex_to_utf8("002B00310034003000340035003500350030003100340032", utf8,
                                   sizeof(utf8));
-   TEST_ASSERT_EQUAL_STRING("+16786432695", utf8);
+   TEST_ASSERT_EQUAL_STRING("+14045550142", utf8);
    TEST_ASSERT_GREATER_THAN(0, len);
 }
 
